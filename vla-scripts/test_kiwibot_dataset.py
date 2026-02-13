@@ -25,8 +25,6 @@ if str(_OMNIVLA_ROOT) not in sys.path:
 
 def _load_processor_or_fallback(vla_path):
     """
-    Intenta cargar el processor completo (tokenizer + image_processor).
-    Si falla (p. ej. PIL.Image.Resampling en Pillow viejo), usa tokenizer mínimo + transform simple.
     Returns (base_tokenizer, image_transform, action_tokenizer).
     """
     try:
@@ -46,7 +44,7 @@ def _load_processor_or_fallback(vla_path):
     except Exception:
         pass  
 
-    print("  (Processor completo no disponible, usando tokenizer + transform mínimos)")
+    print("  (Full processor not available, using minimal tokenizer + transform)")
     from transformers import AutoTokenizer
     import torch
     from torchvision import transforms
@@ -66,7 +64,7 @@ def _load_processor_or_fallback(vla_path):
 
 
 def _show_sample(sample, label):
-    """Imprime el contenido de un sample (claves, formas, y un resumen de valores)."""
+    """Print the content of a sample (keys, shapes, and a summary of values)."""
     print(f"\n--- {label} ---")
     for k, v in sample.items():
         if hasattr(v, "shape"):
@@ -79,22 +77,22 @@ def _show_sample(sample, label):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Crear KiwiBotDataset (OmniVLA) y mostrar primer y último sample.")
-    parser.add_argument("--src-dir", type=Path, required=True, help="Path al dataset LeRobot.")
+    parser = argparse.ArgumentParser(description="Create KiwiBotDataset (OmniVLA) and show first and last sample.")
+    parser.add_argument("--src-dir", type=Path, required=True, help="Path to LeRobot dataset.")
     parser.add_argument("--vla-path", type=str, default="openvla/openvla-7b", help="Modelo HF para cargar processor.")
     args = parser.parse_args()
 
     if not args.src_dir.is_dir():
-        print(f"Error: no existe el directorio {args.src_dir}")
+        print(f"Error: directory does not exist: {args.src_dir}")
         return 1
 
-    print("Cargando processor (o fallback tokenizer+transform)...")
+    print("Loading processor (or fallback tokenizer+transform)...")
     from prismatic.vla.datasets import KiwiBotDatasetComplete
     from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 
     base_tokenizer, image_transform, action_tokenizer = _load_processor_or_fallback(args.vla_path)
 
-    print("Creando dataset en formato OmniVLA (KiwiBotDataset)...")
+    print("Creating dataset in OmniVLA format (KiwiBotDataset)...")
     dataset = KiwiBotDatasetComplete(
         src_dir=args.src_dir,
         action_tokenizer=action_tokenizer,
@@ -107,17 +105,12 @@ def main():
     n = len(dataset)
     print(f"  len(dataset) = {n}")
     if n == 0:
-        print("  No hay muestras válidas (episodios con al menos NUM_ACTIONS_CHUNK pasos).")
+        print("  No valid samples (episodes with at least NUM_ACTIONS_CHUNK steps).")
         return 0
 
-    # Primer episodio
-    print("\nObteniendo primer sample (primer episodio)...")
-    #first = dataset[0]
-    #_show_sample(first, "Primer episodio (dataset[0])")
-
-    print("Obteniendo último sample (dataset[n-1])...")
-    last = dataset[944]
-    _show_sample(last, "Último episodio (dataset[len-1])")
+    print("Getting last sample (dataset[n-1])...")
+    last = dataset[18]
+    _show_sample(last, "Last episode (dataset[len-1])")
 
     return 0
 

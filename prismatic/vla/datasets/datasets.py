@@ -281,7 +281,6 @@ class DummyDataset(Dataset):
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
-# Our dataset
 
 def _parse_lerobot_step(data_item: Dict[str, Any]) -> Tuple[Dict[str, Any], np.ndarray, str]:
     """
@@ -290,33 +289,39 @@ def _parse_lerobot_step(data_item: Dict[str, Any]) -> Tuple[Dict[str, Any], np.n
     """
     observation_info = {}
     for k, v in data_item.items():
-        if "observation.image" in k and "depth" not in k:
-            # LeRobot image is (C, H, W) in [0, 1]
+        # Only observation.image.main (ignore observation.image.left, observation.image.right)
+        if k == "observation.image.main":
             arr = np.asarray(v) if not hasattr(v, "numpy") else v.numpy()
+            if arr.ndim == 4:
+                arr = arr[0]
             if arr.max() <= 1.0:
                 arr = (arr * 255).astype(np.uint8)
-            observation_info[k.split(".")[-1]] = np.transpose(arr, (1, 2, 0))
-        elif "observation.state" in k:
-            key = "_".join(k.split(".")[2:]) or k.split(".")[-1]
-            # Observaciones pueden ser numéricas (tensor/array) o str (ej. surface, weather, time_of_day)
-            if isinstance(v, str):
-                observation_info[key] = np.array([v], dtype=object)
-            elif hasattr(v, "numpy"):
-                observation_info[key] = v.numpy()
-            else:
-                observation_info[key] = np.asarray(v)
+            observation_info["main"] = np.transpose(arr, (1, 2, 0)) if arr.ndim == 3 else np.asarray(arr, dtype=np.uint8)
+        elif k == "observation.state.waypoints":
+            observation_info["waypoints"] = np.asarray(v.numpy() if hasattr(v, "numpy") else v, dtype=np.float64)
+        elif k == "observation.state":  #TWIST
+            arr = v.numpy() if hasattr(v, "numpy") else np.asarray(v)
+            observation_info["state"] = np.asarray(arr, dtype=np.float64)
+        elif k == "observation.state.road_type":
+            observation_info["road_type"] = np.array([str(v)], dtype=object)
+        elif k == "observation.state.surface":
+            observation_info["surface"] = np.array([str(v)], dtype=object)
+        elif k == "observation.state.weather":
+            observation_info["weather"] = np.array([str(v)], dtype=object)
+        elif k == "observation.state.time_of_day":
+            observation_info["time_of_day"] = np.array([str(v)], dtype=object)
 
-    action_info = {}
-    for k, v in data_item.items():
-        if "action" in k:
-            key = "_".join(k.split(".")[2:]) or k.split(".")[-1]
-            action_info[key] = v.numpy() if hasattr(v, "numpy") else np.asarray(v)
-    action_arr = (
-        list(action_info.values())[0]
-        if len(action_info) == 1
-        else np.concatenate([np.atleast_1d(v) for v in action_info.values()])
-    )
-    action_arr = np.atleast_1d(np.asarray(action_arr, dtype=np.float32))
+    # Action is: [twist.linear.x, twist.angular.z]
+    v = data_item.get("action")
+    if v is None:
+        action_arr = np.zeros(2, dtype=np.float32)
+    else:
+        action_arr = np.asarray(
+            v.numpy() if hasattr(v, "numpy") else v,
+            dtype=np.float32,
+        ).flatten()
+        if action_arr.size != 2:
+            action_arr = np.resize(action_arr, 2)
 
     lang = data_item.get("task", "")
     if hasattr(lang, "decode"):
@@ -369,14 +374,13 @@ def convert_velocity_chunk_to_waypoints(
 
 
 def _get_primary_image_from_observation(observation: Dict[str, Any]) -> np.ndarray:
-    """Return primary RGB image (H, W, C) uint8. Prefer 'main', then 'image', then first image key."""
-    for key in ("main", "image", "image_0"):
-        if key in observation:
-            return np.asarray(observation[key], dtype=np.uint8)
-    for k, v in observation.items():
-        if isinstance(v, np.ndarray) and v.ndim == 3 and v.shape[-1] in (3, 4):
-            return np.asarray(v, dtype=np.uint8)
-    raise KeyError(f"No image found in observation keys: {list(observation.keys())}")
+    """Return primary RGB image (H, W, C) uint8 from observation.image.main (stored as observation['main'])."""
+    if "main" not in observation:
+        raise KeyError(f"observation['main'] not found; keys: {list(observation.keys())}")
+    out = np.asarray(observation["main"], dtype=np.uint8)
+    if out.ndim != 3:
+        raise ValueError(f"Expected image shape (H, W, C), got {out.shape}")
+    return out
 
 class KiwiBotDatasetComplete(Dataset):
     """
@@ -399,6 +403,7 @@ class KiwiBotDatasetComplete(Dataset):
         context_size: int = 1,
         mbra_image_size: Tuple[int, int] = (96, 96),
         action_spacing: int = 1,
+        metric_waypoint_spacing: float = 0.1,
     ):
         from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
@@ -412,6 +417,7 @@ class KiwiBotDatasetComplete(Dataset):
         self.predict_stop_token = predict_stop_token #Whether to include the stop token in the labels for loss calculation (if False, stop token is ignored)
         self.image_size = image_size #Resolution for current and goal images after transform (pixel_values_current, pixel_values_goal)
         self.mbra_image_size = tuple(mbra_image_size) #Resolution for images in cur_image and goal_image_8 used for MBRA-style inputs (smaller for efficiency)
+        self.metric_waypoint_spacing = metric_waypoint_spacing  # meters; used for goal_pose norm and convert_velocity_chunk_to_waypoints
         self._LeRobotDataset = LeRobotDataset 
         self._LeRobotDatasetMetadata = LeRobotDatasetMetadata
 
@@ -427,24 +433,21 @@ class KiwiBotDatasetComplete(Dataset):
                 self._episode_lengths[ep_id] = int(length)
             print("Loaded episode", ep_id, "length", length)
 
-        self._episode_ids = sorted(self._episode_lengths.keys())
+        self._episode_ids = sorted(self._episode_lengths.keys())  #Some times lerobot datasets are imported in different order
 
         self._index: List[Tuple[int, int]] = []
         for ep_idx in self._episode_ids:
             L = self._episode_lengths[ep_idx]
-            # Include any frame that has at least 8 future steps. If 8*action_spacing fit, use spacing; else fallback to 8 consecutive (spacing 1).
             max_start = max(0, L - (NUM_ACTIONS_CHUNK - 1))  # need frame_idx+7 valid, so frame_idx in 0..L-8
             for frame_idx in range(max_start):
                 self._index.append((ep_idx, frame_idx))
 
+
     def __len__(self) -> int:
         return len(self._index)
 
-    def _resize_norm(self, image_tensor: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
-        """Resize image tensor (C,H,W) to size for MBRA-style inputs."""
-        return TF.resize(image_tensor, size)
 
-    @staticmethod
+    @staticmethod  #static method because self is not being used
     def _calculate_relative_position(x_a: float, y_a: float, x_b: float, y_b: float) -> Tuple[float, float]:
         """Delta from (x_a, y_a) to (x_b, y_b) in UTM."""
         return x_b - x_a, y_b - y_a
@@ -465,7 +468,6 @@ class KiwiBotDatasetComplete(Dataset):
         current_compass_deg: float = 0.0,
         goal_compass_deg: float = 0.0,
         thres_dist: float = 30.0,
-        metric_waypoint_spacing: float = 0.1,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute goal_pose [X, Y, cos(yaw), sin(yaw)] and obj_pose_norm [X, Y] in local frame,
@@ -486,8 +488,8 @@ class KiwiBotDatasetComplete(Dataset):
             relative_y *= thres_dist / radius
 
         goal_pose = np.array([
-            relative_y / metric_waypoint_spacing,
-            -relative_x / metric_waypoint_spacing,
+            relative_y / self.metric_waypoint_spacing,
+            -relative_x / self.metric_waypoint_spacing,
             np.cos(goal_compass - cur_compass),
             np.sin(goal_compass - cur_compass),
         ], dtype=np.float32)
@@ -496,12 +498,16 @@ class KiwiBotDatasetComplete(Dataset):
 
     def _load_episode_steps(self, episode_index: int) -> List[Dict[str, Any]]:
         """Load one episode and return list of parsed steps, ordered by frame_index."""
+        total_frames = self._episode_lengths.get(episode_index, 0)
+        print(f"[KiwiBot] Loading episode {episode_index} ({total_frames} frames, decoding video per frame)...", flush=True)
         # Use pyav backend to avoid torchcodec (requires PyTorch 2.4+ with register_fake)
         ds = self._LeRobotDataset(
             "", self.src_dir, episodes=[episode_index], video_backend="pyav"
         )
         steps_with_idx = []
-        for data_item in ds:
+        for i, data_item in enumerate(ds):
+            if (i + 1) % 100 == 0 or i == 0:
+                print(f"[KiwiBot]   episode {episode_index}: frame {i + 1}/{total_frames}", flush=True)
             ep = data_item.get("episode_index", episode_index)
             ep_id = int(ep.item() if hasattr(ep, "item") else ep)
             if ep_id != episode_index:
@@ -513,19 +519,51 @@ class KiwiBotDatasetComplete(Dataset):
         steps_with_idx.sort(key=lambda x: x[0])
         return [s for _, s in steps_with_idx]
 
+    def _load_episode_steps_at_frames(
+        self, episode_index: int, frame_idx: int
+    ) -> List[Optional[Dict[str, Any]]]:
+        """Load only the frames needed for __getitem__(episode_index, frame_idx). Returns list of length L with None for unloaded."""
+        L = self._episode_lengths.get(episode_index, 0)
+        last_idx = L - 1
+
+        if frame_idx + (NUM_ACTIONS_CHUNK - 1) * self.action_spacing < L:
+            effective_spacing = self.action_spacing
+        else:
+            effective_spacing = 1
+        indices_to_load = set()
+        indices_to_load.add(frame_idx)
+        indices_to_load.add(last_idx)
+        for k in range(NUM_ACTIONS_CHUNK):
+            indices_to_load.add(min(frame_idx + k * effective_spacing, last_idx))
+        for offset in range(self.context_size + 1): #For MBRA
+            indices_to_load.add(max(0, frame_idx - self.context_size + offset))
+        indices_to_load.add(min(frame_idx + (NUM_ACTIONS_CHUNK - 1) * effective_spacing, last_idx))
+
+        ds = self._LeRobotDataset(
+            "", self.src_dir, episodes=[episode_index], video_backend="pyav"
+        )
+        steps = [None] * L  # type: List[Optional[Dict[str, Any]]]
+        for fi in sorted(indices_to_load):
+            if fi >= L:
+                continue
+            data_item = ds[fi]
+            obs, action, lang = _parse_lerobot_step(data_item)
+            steps[fi] = {"observation": obs, "action": action, "language_instruction": lang}
+        return steps
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         ep_idx, frame_idx = self._index[idx]
-        steps = self._load_episode_steps(ep_idx)
-        expected_len = self._episode_lengths.get(ep_idx)
-        if expected_len is not None and len(steps) != expected_len:
-            raise RuntimeError(
-                f"Episodio {ep_idx}: metadata dice length={expected_len} pero _load_episode_steps devolvió {len(steps)} steps."
-            )
+        steps = self._load_episode_steps_at_frames(ep_idx, frame_idx)
+        
+        
+        if steps[frame_idx] is None:
+            raise RuntimeError(f"Episodio {ep_idx}: no se cargó frame_idx={frame_idx}.")
 
         current_step = steps[frame_idx]
         lang = current_step.get("language_instruction") or ""
         image_current = _get_primary_image_from_observation(current_step["observation"])
         image_pil_current = Image.fromarray(image_current)
+
 
         # Goal image = last frame of episode (goal-conditioned)
         last_idx = len(steps) - 1
@@ -534,15 +572,14 @@ class KiwiBotDatasetComplete(Dataset):
         image_pil_goal = Image.fromarray(image_goal)
 
         # Save current and goal images for this item
-        save_dir = Path("kiwibot_complete") / "images" / str(ep_idx)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        image_pil_current.save(save_dir / f"{frame_idx}_current.png")
-        image_pil_goal.save(save_dir / f"{frame_idx}_goal.png")
+        #save_dir = Path("kiwibot_complete") / "images" / str(ep_idx)
+        #save_dir.mkdir(parents=True, exist_ok=True)
+        #image_pil_current.save(save_dir / f"{frame_idx}_current.png")
+        #image_pil_goal.save(save_dir / f"{frame_idx}_goal.png")
 
         # At least 8 future steps (guaranteed by index). Use action_spacing if enough room; else fallback to 8 consecutive.
         last_action_frame_spaced = frame_idx + (NUM_ACTIONS_CHUNK - 1) * self.action_spacing
         if last_action_frame_spaced < len(steps):
-            # 8 actions at frame_idx, frame_idx+action_spacing, ..., frame_idx+7*action_spacing
             chunk = [steps[frame_idx + k * self.action_spacing] for k in range(NUM_ACTIONS_CHUNK)]
             dt_step = 0.1 * self.action_spacing
             effective_spacing = self.action_spacing
@@ -552,26 +589,13 @@ class KiwiBotDatasetComplete(Dataset):
             dt_step = 0.1
             effective_spacing = 1
 
-        actions = np.stack([s["action"] for s in chunk], axis=0).astype(np.float32)
-
-        # Debug: print 8 raw actions (velocities) and then 8 actions as pose (waypoints)
-        # print("[KiwiBotDatasetComplete] 8 raw actions (velocities) [linear_vel, angular_vel] per step (effective_spacing=%d):" % effective_spacing)
-        # for i in range(actions.shape[0]):
-        #     print(f"  step {i}: {actions[i].tolist()}")
-        # actions = convert_velocity_chunk_to_waypoints(
-        #         actions, dt=dt_step, metric_waypoint_spacing=0.1
-        #     )
-        # print("[KiwiBotDatasetComplete] 8 actions transformed to pose (waypoints) [x_norm, y_norm, cos(theta), sin(theta)]:")
-        # for i in range(actions.shape[0]):
-        #     print(f"  step {i}: {actions[i].tolist()}")
-
-        # Goal from velocity integration: last waypoint (index 7) in same convention as goal_pose [y_norm, -x_norm, cos, sin]
-        goal_pose_from_velocity = np.array([
-            actions[7, 1],   # y_norm
-            -actions[7, 0],  # -x_norm
-            actions[7, 2],  # cos(theta)
-            actions[7, 3],  # sin(theta)
-        ], dtype=np.float32)
+        # Raw actions are (linear.x, angular.z)
+        raw_actions = np.stack([s["action"] for s in chunk], axis=0).astype(np.float32)
+        actions = convert_velocity_chunk_to_waypoints(
+            raw_actions, dt=dt_step, metric_waypoint_spacing=self.metric_waypoint_spacing
+        )
+        print(raw_actions)
+        print(actions)
 
         current_action = actions[0]
         future_actions = actions[1:]
@@ -602,25 +626,20 @@ class KiwiBotDatasetComplete(Dataset):
             img_hist = _get_primary_image_from_observation(step_hist["observation"])
             pil_hist = Image.fromarray(img_hist)
             t = TF.to_tensor(pil_hist)
-            image_obs_list.append(self._resize_norm(t, self.mbra_image_size))
+            image_obs_list.append(TF.resize(t, self.mbra_image_size))
         image_obs = torch.cat(image_obs_list, dim=0)
-        goal_image_8 = self._resize_norm(TF.to_tensor(image_pil_goal), self.mbra_image_size)
+        goal_image_8 = TF.resize(TF.to_tensor(image_pil_goal), self.mbra_image_size)
 
         pixel_values_current = self.image_transform(image_pil_current)
         pixel_values_goal = self.image_transform(image_pil_goal)
 
-        modality_id = 8
+        modality_id = 8 # Language + pose. Check _build_multimodal_attention_MMN() in modeling_prismatic.py 
         action_select_mask = torch.tensor(1.0, dtype=torch.float32)
         dataset_name = "kiwibot"
 
-        waypoints_key = "waypoints"  # _parse_lerobot_step stores observation.state.waypoints as "waypoints"
+        waypoints_key = "waypoints"  
         cur_wp = current_step.get("observation", {}).get(waypoints_key)
         goal_wp = goal_step.get("observation", {}).get(waypoints_key)
-
-        # Chunk-end frame: goal = last frame used in the 8-step velocity chunk (frame_idx + 7*action_spacing)
-        goal_frame_chunk_idx = frame_idx + (NUM_ACTIONS_CHUNK - 1) * effective_spacing
-        goal_step_chunk = steps[goal_frame_chunk_idx] if goal_frame_chunk_idx < len(steps) else None
-        goal_wp_chunk = goal_step_chunk.get("observation", {}).get(waypoints_key) if goal_step_chunk is not None else None
 
         if (
             cur_wp is not None
@@ -639,9 +658,11 @@ class KiwiBotDatasetComplete(Dataset):
                     goal_compass_deg=0.0,
                 )
             else:
+                print("WARN: Not valid goal_pose, setting to NAN")
                 goal_pose = np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float32)
                 obj_pose_norm = np.array([np.nan, np.nan], dtype=np.float32)
         else:
+            print("WARN: Not valid goal_pose, setting to NAN")
             goal_pose = np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float32)
             obj_pose_norm = np.array([np.nan, np.nan], dtype=np.float32)
 
