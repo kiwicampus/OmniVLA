@@ -594,8 +594,8 @@ class KiwiBotDatasetComplete(Dataset):
         actions = convert_velocity_chunk_to_waypoints(
             raw_actions, dt=dt_step, metric_waypoint_spacing=self.metric_waypoint_spacing
         )
-        print(raw_actions)
-        print(actions)
+        #print(raw_actions)
+        #print(actions)
 
         current_action = actions[0]
         future_actions = actions[1:]
