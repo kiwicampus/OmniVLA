@@ -38,7 +38,9 @@ from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE
 
-from peft import PeftModel, LoraConfig, get_peft_model
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file as load_safetensors
+from peft import PeftModel
 from transformers import AutoConfig, AutoProcessor, AutoModelForVision2Seq, AutoImageProcessor
 
 # ===============================================================
@@ -528,13 +530,21 @@ def define_model(cfg: InferenceConfig) -> None:
     ) else cfg.base_model_path
     processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
 
-    # Load the base VLA and apply the saved LoRA adapter.
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.base_model_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    # Download base model to local cache and load it as our custom class so that
+    # OmniVLA-specific methods (e.g. set_num_images_in_input) are available after
+    # the LoRA merge. Using AutoModelForVision2Seq with trust_remote_code=True would
+    # instantiate the upstream openvla class instead.
+    local_model_path = snapshot_download(repo_id=cfg.base_model_path)
+    index = json.loads(open(os.path.join(local_model_path, "model.safetensors.index.json")).read())
+    state_dict = {}
+    for filename in sorted(set(index["weight_map"].values())):
+        state_dict.update(load_safetensors(os.path.join(local_model_path, filename)))
+
+    config_openvla = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
+    vla = OpenVLAForActionPrediction_MMNv1(config_openvla)
+    vla.load_state_dict(state_dict, strict=False)
+    vla = vla.to(dtype=torch.bfloat16)
+
     lora_adapter_dir = os.path.join(cfg.checkpoint_dir, "lora_adapter")
     print(f"Loading LoRA adapter from `{lora_adapter_dir}`")
     vla = PeftModel.from_pretrained(vla, lora_adapter_dir)
