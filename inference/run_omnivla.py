@@ -503,8 +503,9 @@ def define_model(cfg: InferenceConfig) -> None:
 
     # GPU setup
     device_id = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(device_id)
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device_id)
+        torch.cuda.empty_cache()
 
     print(
         "Detected constants:\n"
