@@ -12,21 +12,55 @@
 Please set up a conda environment (see instructions in [SETUP.md](SETUP.md)).
 
 ### Inference
-1. Download our checkpoints and place them in our directory. "omnivla-original" is the trained checkpoints of the OmniVLA for paper submission. "omnivla-original-balance" contains the trained checkpoints of OmniVLA that account for the data balance in the LeLaN dataset. And "omnivla-finetuned-cast" is finetuned checkpoints with the [CAST](https://huggingface.co/datasets/catglossop/CAST-dataset) dataset.
+
+#### Original paper checkpoints (fully merged models)
+1. Download the original checkpoints and place them in the repo root. "omnivla-original" is the trained checkpoints of the OmniVLA for paper submission. "omnivla-original-balance" contains the trained checkpoints of OmniVLA that account for the data balance in the LeLaN dataset. And "omnivla-finetuned-cast" is finetuned checkpoints with the [CAST](https://huggingface.co/datasets/catglossop/CAST-dataset) dataset.
     ```
     git clone https://huggingface.co/NHirose/omnivla-original
     git clone https://huggingface.co/NHirose/omnivla-original-balance    
     git clone https://huggingface.co/NHirose/omnivla-finetuned-cast
     ```
+
 2. Run OmniVLA using a sample current image, goal images, GPS pose, and language prompt. You can view the generated trajectory in the output figure 1_ex.jpg.
     ```
     python inference/run_omnivla.py
     ```
-3. Change the goal modality: by default, our code generates actions based on the language prompt. To use a different modality, you can modify the settings around line 560. 
-    
-4. Run OmniVLA to control the real robot. Modify "run_omnivla.py" to update the robot’s state (camera image, GPS signal) and adjust the goal information accordingly. Then, feed the generated velocity commands to your robot.
 
-5. To try the finetuned checkpoints with the CAST dataset, update the path and step number in "InferenceConfig" within "run_omnivla.py".
+3. Change the goal modality: by default, our code generates actions based on the language prompt. To use a different modality, you can modify the settings around line 560.
+
+4. Run OmniVLA to control the real robot. Modify `run_omnivla.py` to update the robot’s state (camera image, GPS signal) and adjust the goal information accordingly. Then, feed the generated velocity commands to your robot.
+
+#### Fine-tuned checkpoints from `train_omnivla_single_dataset.py` (LoRA format)
+
+Checkpoints produced by `vla-scripts/train_omnivla_single_dataset.py` are **not** fully merged models. Each checkpoint folder contains:
+- `lora_adapter/` — the LoRA adapter weights (applied on top of the base `openvla/openvla-7b`)
+- `action_head--{step}_checkpoint.pt` — the action head MLP
+- `pose_projector--{step}_checkpoint.pt` — the pose projector MLP
+- tokenizer files
+
+To run inference with one of these checkpoints:
+
+1. Download the checkpoint folder from GCS (example for step 23500):
+    ```bash
+    gsutil -m cp -r \
+      "gs://autonomy-vision/training-logs/omnivla/artifacts/Alejoxbg/omnivla-2026-04-02-15-43-15/openvla-7b+dataset_20260330+b8+lr-2e-05--23500_chkpt" \
+      ./checkpoints/
+    ```
+
+2. Update `InferenceConfig` in `inference/run_omnivla.py`:
+    ```python
+    class InferenceConfig:
+        base_model_path: str = "openvla/openvla-7b"   # base model (HF hub or local)
+        checkpoint_dir:  str = "./checkpoints/openvla-7b+dataset_20260330+b8+lr-2e-05--23500_chkpt"
+        resume_step:     int = 23500
+    ```
+
+3. Run inference:
+    ```bash
+    python inference/run_omnivla.py
+    ```
+
+The script will load the base model, apply and fuse the LoRA adapter, then load the action head and pose projector from the checkpoint folder.
 
 ### Training
 We provide the training code along with a sample dataloader to help you quickly understand the required data loading structure. Since preparing the full training dataset is resource-intensive, we include this simplified code base for convenience.

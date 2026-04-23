@@ -38,6 +38,7 @@ from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE
 
+from peft import PeftModel, LoraConfig, get_peft_model
 from transformers import AutoConfig, AutoProcessor, AutoModelForVision2Seq, AutoImageProcessor
 
 # ===============================================================
@@ -46,10 +47,10 @@ from transformers import AutoConfig, AutoProcessor, AutoModelForVision2Seq, Auto
 def remove_ddp_in_checkpoint(state_dict: dict) -> dict:
     return {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
 
-def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
-    if not os.path.exists(os.path.join(path, f"{module_name}--{step}_checkpoint.pt")) and module_name == "pose_projector":
+def load_checkpoint(module_name: str, checkpoint_dir: str, step: int, device: str = "cpu") -> dict:
+    if not os.path.exists(os.path.join(checkpoint_dir, f"{module_name}--{step}_checkpoint.pt")) and module_name == "pose_projector":
         module_name = "proprio_projector"
-    checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
+    checkpoint_path = os.path.join(checkpoint_dir, f"{module_name}--{step}_checkpoint.pt")
     print(f"Loading checkpoint: {checkpoint_path}")
     state_dict = torch.load(checkpoint_path, map_location=device)
     return remove_ddp_in_checkpoint(state_dict)
@@ -70,7 +71,7 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        state_dict = load_checkpoint(module_name, cfg.checkpoint_dir, cfg.resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -481,21 +482,24 @@ class Inference:
 # ===============================================================
 class InferenceConfig:
     resume: bool = True
-    vla_path: str = "./omnivla-original"
-    resume_step: Optional[int] = 120000    
-    #vla_path: str = "./omnivla-finetuned-cast"    
-    #resume_step: Optional[int] = 210000
+    # Path to the base OpenVLA model (HF hub ID or local path).
+    base_model_path: str = "openvla/openvla-7b"
+    # Local path to the checkpoint folder produced by train_omnivla_single_dataset.py.
+    # It must contain: lora_adapter/, action_head--{step}_checkpoint.pt,
+    # pose_projector--{step}_checkpoint.pt, and tokenizer files.
+    checkpoint_dir: str = "./checkpoints/openvla-7b+dataset_20260330+b8+lr-2e-05--23500_chkpt"
+    resume_step: Optional[int] = 23500
     use_l1_regression: bool = True
     use_diffusion: bool = False
     use_film: bool = False
     num_images_in_input: int = 2
-    use_lora: bool = True
     lora_rank: int = 32
     lora_dropout: float = 0.0
 
 def define_model(cfg: InferenceConfig) -> None:
-    cfg.vla_path = cfg.vla_path.rstrip("/")
-    print(f"Loading OpenVLA Model `{cfg.vla_path}`")
+    cfg.checkpoint_dir = cfg.checkpoint_dir.rstrip("/")
+    print(f"Loading base model from `{cfg.base_model_path}`")
+    print(f"Loading checkpoint from `{cfg.checkpoint_dir}` (step {cfg.resume_step})")
 
     # GPU setup
     device_id = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -515,15 +519,26 @@ def define_model(cfg: InferenceConfig) -> None:
     AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction_MMNv1)
-    
-    # Load processor and VLA
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+
+    # Load processor from the checkpoint dir (it has the saved tokenizer files).
+    # Fall back to base model if the checkpoint dir doesn't have a processor config.
+    processor_path = cfg.checkpoint_dir if os.path.exists(
+        os.path.join(cfg.checkpoint_dir, "processor_config.json")
+    ) else cfg.base_model_path
+    processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
+
+    # Load the base VLA and apply the saved LoRA adapter.
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
+        cfg.base_model_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-    ).to(device_id) #            trust_remote_code=True,
-    
+        trust_remote_code=True,
+    )
+    lora_adapter_dir = os.path.join(cfg.checkpoint_dir, "lora_adapter")
+    print(f"Loading LoRA adapter from `{lora_adapter_dir}`")
+    vla = PeftModel.from_pretrained(vla, lora_adapter_dir)
+    vla = vla.merge_and_unload()  # fuse LoRA into base weights for faster inference
+
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
     vla.to(dtype=torch.bfloat16, device=device_id)
     
