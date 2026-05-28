@@ -16,6 +16,24 @@ Los scripts historicos de entrenamiento multi-dataset/MBRA fueron removidos para
 
 Para replicar este repo en otro PC:
 
+Si no tienes conda instalado, instala Miniconda primero:
+
+```bash
+curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh
+bash /tmp/miniconda.sh -b -p ~/miniconda3
+export PATH="$HOME/miniconda3/bin:$PATH"
+```
+
+En versiones recientes de conda (26+) hay que aceptar los Terms of Service antes
+de crear envs:
+
+```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
+
+Luego:
+
 ```bash
 bash scripts/omnivla_training.sh setup
 conda activate omnivla

@@ -12,7 +12,23 @@ Los scripts antiguos `vla-scripts/train_omnivla_dataset.py`, `vla-scripts/train_
 
 ## Setup rapido
 
-En una maquina nueva:
+En una maquina nueva sin conda, instala Miniconda primero:
+
+```bash
+curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh
+bash /tmp/miniconda.sh -b -p ~/miniconda3
+export PATH="$HOME/miniconda3/bin:$PATH"
+```
+
+En versiones recientes de conda (26+) hay que aceptar los Terms of Service antes
+de crear envs por primera vez:
+
+```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
+
+Luego:
 
 ```bash
 bash scripts/omnivla_training.sh setup
@@ -42,7 +58,8 @@ bash scripts/omnivla_training.sh train
 
 ## Ruta local en 6 pasos
 
-1. Crea el entorno:
+1. Crea el entorno (si no tienes conda, instala Miniconda primero; ver
+   "Setup rapido" mas arriba):
 
 ```bash
 bash scripts/omnivla_training.sh setup
