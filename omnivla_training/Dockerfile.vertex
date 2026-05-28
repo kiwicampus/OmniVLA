@@ -1,0 +1,31 @@
+# Vertex AI custom container for OmniVLA fine-tuning on a single dataset.
+FROM gcr.io/deeplearning-platform-release/pytorch-cu124.2-4.py310:m130
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV HF_HOME=/tmp/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/tmp/huggingface/hub
+ENV TRANSFORMERS_CACHE=/tmp/huggingface/hub
+ENV TORCH_HOME=/tmp/torch
+ENV WANDB_DIR=/tmp/wandb
+ENV TOKENIZERS_PARALLELISM=false
+
+RUN apt-get update && apt-get install -y ffmpeg git && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app
+
+ARG TORCH_VERSION=2.7.0
+ARG TORCHVISION_VERSION=0.22.0
+ARG TORCHAUDIO_VERSION=2.7.0
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+
+RUN python -m pip install --upgrade pip setuptools wheel packaging
+RUN python -m pip install --index-url "${TORCH_INDEX_URL}" --force-reinstall \
+    "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}"
+RUN python -m pip install -e .
+RUN python -m pip install --no-deps lerobot==0.4.3
+RUN python -m pip install google-cloud-aiplatform google-cloud-storage google-cloud-secret-manager google-crc32c typer pyyaml
+
+ENTRYPOINT ["python3", "/app/omnivla_training/training_scripts/vertex_train_omnivla_wrapper.py"]

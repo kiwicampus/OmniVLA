@@ -1,0 +1,46 @@
+# Build and push the OmniVLA Vertex training image from the repo root.
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      [
+        "-c",
+        "docker pull ${_IMAGE_URI}:latest || exit 0",
+      ]
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "build",
+        "-f",
+        "omnivla_training/Dockerfile.vertex",
+        "-t",
+        "${_IMAGE_URI}:latest",
+        "--build-arg",
+        "TORCH_VERSION=${_TORCH_VERSION}",
+        "--build-arg",
+        "TORCHVISION_VERSION=${_TORCHVISION_VERSION}",
+        "--build-arg",
+        "TORCHAUDIO_VERSION=${_TORCHAUDIO_VERSION}",
+        "--build-arg",
+        "TORCH_INDEX_URL=${_TORCH_INDEX_URL}",
+        "--cache-from",
+        "${_IMAGE_URI}:latest",
+        ".",
+      ]
+
+images:
+  - "${_IMAGE_URI}:latest"
+
+substitutions:
+  _IMAGE_URI: "gcr.io/$PROJECT_ID/omnivla-training"
+  _TORCH_VERSION: "2.7.0"
+  _TORCHVISION_VERSION: "0.22.0"
+  _TORCHAUDIO_VERSION: "2.7.0"
+  _TORCH_INDEX_URL: "https://download.pytorch.org/whl/cu128"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: "E2_HIGHCPU_8"
+
+timeout: 7200s

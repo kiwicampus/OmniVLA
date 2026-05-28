@@ -6,6 +6,7 @@ format to OpenVLA, IterableDataset shim.
 """
 
 import math
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -26,6 +27,31 @@ from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYP
 
 # RLDS imports are lazy (inside RLDSDataset / EpisodicRLDSDataset) so that loading KiwiBotDatasetComplete
 # or other non-RLDS code does not require dlimp/tensorflow RLDS stack.
+
+
+def _import_lerobot_dataset_classes():
+    """Import LeRobot dataset classes across the package layouts used by recent LeRobot releases."""
+    import_errors = []
+
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+
+        return LeRobotDataset, LeRobotDatasetMetadata
+    except Exception as exc:  # pragma: no cover - exercised only when the first import path is unavailable.
+        import_errors.append(exc)
+
+    try:
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+
+        return LeRobotDataset, LeRobotDatasetMetadata
+    except Exception as exc:  # pragma: no cover - exercised only when the fallback import path is unavailable.
+        import_errors.append(exc)
+
+    errors = " | ".join(repr(exc) for exc in import_errors)
+    raise ImportError(
+        "Unable to import LeRobot dataset classes. Install a compatible `lerobot` package "
+        f"(for example `lerobot==0.4.3`). Import errors: {errors}"
+    )
 
 @dataclass
 class RLDSBatchTransform:
@@ -282,7 +308,7 @@ class DummyDataset(Dataset):
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
 
-def _parse_lerobot_step(data_item: Dict[str, Any]) -> Tuple[Dict[str, Any], np.ndarray, str]:
+def _parse_lerobot_step(data_item: Dict[str, Any], action_key: str = "action") -> Tuple[Dict[str, Any], np.ndarray, str]:
     """
     Parse one step from a LeRobot data_item into observation dict, action array, and language_instruction.
     Mirrors lerobot2rlds.parse_step: images (C,H,W) [0,1] -> (H,W,C) uint8; actions and task extracted.
@@ -311,8 +337,10 @@ def _parse_lerobot_step(data_item: Dict[str, Any]) -> Tuple[Dict[str, Any], np.n
         elif k == "observation.state.time_of_day":
             observation_info["time_of_day"] = np.array([str(v)], dtype=object)
 
-    # Action is: [twist.linear.x, twist.angular.z]
-    v = data_item.get("action")
+    # Canonical OmniVLA action source is [twist.linear.x, twist.angular.z].
+    # Some LeRobot datasets store that in `action`; others store it in
+    # `observation.state` and reserve `action` for waypoint/lat-lon targets.
+    v = data_item.get(action_key)
     if v is None:
         action_arr = np.zeros(2, dtype=np.float32)
     else:
@@ -404,9 +432,17 @@ class KiwiBotDatasetComplete(Dataset):
         mbra_image_size: Tuple[int, int] = (96, 96),
         action_spacing: int = 1,
         metric_waypoint_spacing: float = 0.1,
+        action_key: str = "action",
+        episodes: Optional[List[int]] = None,
+        dataset_name: str = "lerobot_local",
+        default_language_instruction: str = "reach the goal image",
+        modality_id_with_pose: int = 8,
+        modality_id_without_pose: int = 6,
+        video_backend: str = "pyav",
+        tolerance_s: Optional[float] = None,
+        max_decode_retries: int = 8,
     ):
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-
+        LeRobotDataset, LeRobotDatasetMetadata = _import_lerobot_dataset_classes()
         self.src_dir = Path(src_dir)
         self.context_size = context_size  #Number of past frames to include in cur_image for MBRA-style inputs
         self.action_spacing = action_spacing  # Step between consecutive future actions (1=consecutive frames, 3=every 3rd frame, etc.)
@@ -418,22 +454,49 @@ class KiwiBotDatasetComplete(Dataset):
         self.image_size = image_size #Resolution for current and goal images after transform (pixel_values_current, pixel_values_goal)
         self.mbra_image_size = tuple(mbra_image_size) #Resolution for images in cur_image and goal_image_8 used for MBRA-style inputs (smaller for efficiency)
         self.metric_waypoint_spacing = metric_waypoint_spacing  # meters; used for goal_pose norm and convert_velocity_chunk_to_waypoints
+        self.action_key = action_key
+        self.dataset_name = dataset_name
+        self.default_language_instruction = default_language_instruction
+        self.modality_id_with_pose = int(modality_id_with_pose)
+        self.modality_id_without_pose = int(modality_id_without_pose)
+        self.video_backend = video_backend
+        self.tolerance_s = None if tolerance_s is None else float(tolerance_s)
+        self.max_decode_retries = max(1, int(max_decode_retries))
         self._LeRobotDataset = LeRobotDataset 
         self._LeRobotDatasetMetadata = LeRobotDatasetMetadata
 
         meta = LeRobotDatasetMetadata("", root=self.src_dir)
-        episodes = meta.episodes
+        episode_rows = meta.episodes
         self._episode_lengths = {}
 
-        for i in range(len(episodes)):
-            row = episodes[i]
+        for i in range(len(episode_rows)):
+            row = episode_rows[i]
             ep_id = int(row.get("episode_index", row.get("index", i)))
             length = row.get("length")
             if length is not None:
                 self._episode_lengths[ep_id] = int(length)
-            print("Loaded episode", ep_id, "length", length)
 
-        self._episode_ids = sorted(self._episode_lengths.keys())  #Some times lerobot datasets are imported in different order
+        all_episode_ids = sorted(self._episode_lengths.keys())  # Some times lerobot datasets are imported in different order
+        if episodes is None:
+            self._episode_ids = all_episode_ids
+        else:
+            requested_episode_ids = sorted({int(ep) for ep in episodes})
+            missing_episode_ids = [ep for ep in requested_episode_ids if ep not in self._episode_lengths]
+            self._episode_ids = [ep for ep in requested_episode_ids if ep in self._episode_lengths]
+            if not self._episode_ids:
+                raise ValueError(
+                    f"No requested episodes were found under {self.src_dir}. Requested={requested_episode_ids[:10]}"
+                )
+            if missing_episode_ids:
+                print(
+                    f"[KiwiBot] Skipping {len(missing_episode_ids)} missing episodes "
+                    f"(first few: {missing_episode_ids[:10]})"
+                )
+
+        print(
+            f"[KiwiBot] Using {len(self._episode_ids)} episodes from {self.src_dir} "
+            f"({len(all_episode_ids)} episodes available in metadata)."
+        )
 
         self._index: List[Tuple[int, int]] = []
         for ep_idx in self._episode_ids:
@@ -500,10 +563,7 @@ class KiwiBotDatasetComplete(Dataset):
         """Load one episode and return list of parsed steps, ordered by frame_index."""
         total_frames = self._episode_lengths.get(episode_index, 0)
         print(f"[KiwiBot] Loading episode {episode_index} ({total_frames} frames, decoding video per frame)...", flush=True)
-        # Use pyav backend to avoid torchcodec (requires PyTorch 2.4+ with register_fake)
-        ds = self._LeRobotDataset(
-            "", self.src_dir, episodes=[episode_index], video_backend="pyav"
-        )
+        ds = self._build_lerobot_dataset(episode_index)
         steps_with_idx = []
         for i, data_item in enumerate(ds):
             if (i + 1) % 100 == 0 or i == 0:
@@ -514,7 +574,7 @@ class KiwiBotDatasetComplete(Dataset):
                 continue
             fi = data_item.get("frame_index", len(steps_with_idx))
             frame_index = int(fi.item() if hasattr(fi, "item") else fi)
-            obs, action, lang = _parse_lerobot_step(data_item)
+            obs, action, lang = _parse_lerobot_step(data_item, action_key=self.action_key)
             steps_with_idx.append((frame_index, {"observation": obs, "action": action, "language_instruction": lang}))
         steps_with_idx.sort(key=lambda x: x[0])
         return [s for _, s in steps_with_idx]
@@ -539,28 +599,80 @@ class KiwiBotDatasetComplete(Dataset):
             indices_to_load.add(max(0, frame_idx - self.context_size + offset))
         indices_to_load.add(min(frame_idx + (NUM_ACTIONS_CHUNK - 1) * effective_spacing, last_idx))
 
-        ds = self._LeRobotDataset(
-            "", self.src_dir, episodes=[episode_index], video_backend="pyav"
-        )
+        ds = self._build_lerobot_dataset(episode_index)
         steps = [None] * L  # type: List[Optional[Dict[str, Any]]]
         for fi in sorted(indices_to_load):
             if fi >= L:
                 continue
             data_item = ds[fi]
-            obs, action, lang = _parse_lerobot_step(data_item)
+            obs, action, lang = _parse_lerobot_step(data_item, action_key=self.action_key)
             steps[fi] = {"observation": obs, "action": action, "language_instruction": lang}
         return steps
 
+    def _build_lerobot_dataset(self, episode_index: int):
+        kwargs = {
+            "episodes": [episode_index],
+            "video_backend": self.video_backend,
+        }
+        if self.tolerance_s is not None:
+            kwargs["tolerance_s"] = self.tolerance_s
+
+        try:
+            return self._LeRobotDataset("", self.src_dir, **kwargs)
+        except TypeError:
+            kwargs.pop("tolerance_s", None)
+            return self._LeRobotDataset("", self.src_dir, **kwargs)
+
+    @staticmethod
+    def _is_skippable_decode_error(exc: Exception) -> bool:
+        message = str(exc)
+        skip_markers = (
+            "unexpectedly violate the tolerance",
+            "ignore this item during training",
+            "decode_video_frames",
+            "avcodec_send_packet",
+            "Invalid data found when processing input",
+            "InvalidDataError",
+        )
+        return any(marker in message for marker in skip_markers)
+
+    def _fallback_index(self, idx: int, attempt: int) -> int:
+        if len(self._index) <= 1:
+            return idx
+        if attempt == 0:
+            return (idx + 1) % len(self._index)
+        return random.randrange(len(self._index))
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        ep_idx, frame_idx = self._index[idx]
-        steps = self._load_episode_steps_at_frames(ep_idx, frame_idx)
-        
+        last_exc: Optional[Exception] = None
+        candidate_idx = idx
+
+        for attempt in range(self.max_decode_retries):
+            ep_idx, frame_idx = self._index[candidate_idx]
+            try:
+                steps = self._load_episode_steps_at_frames(ep_idx, frame_idx)
+                break
+            except Exception as exc:
+                if not self._is_skippable_decode_error(exc):
+                    raise
+                last_exc = exc
+                print(
+                    f"[KiwiBot] Skipping sample idx={candidate_idx} "
+                    f"(episode={ep_idx}, frame={frame_idx}) due to video decode tolerance error: {exc}",
+                    flush=True,
+                )
+                candidate_idx = self._fallback_index(idx, attempt)
+        else:
+            raise RuntimeError(
+                f"Exceeded decode retries for dataset index {idx}. Last error: {last_exc}"
+            ) from last_exc
+
         
         if steps[frame_idx] is None:
             raise RuntimeError(f"Episodio {ep_idx}: no se cargó frame_idx={frame_idx}.")
 
         current_step = steps[frame_idx]
-        lang = current_step.get("language_instruction") or ""
+        lang = current_step.get("language_instruction") or self.default_language_instruction
         image_current = _get_primary_image_from_observation(current_step["observation"])
         image_pil_current = Image.fromarray(image_current)
 
@@ -568,6 +680,8 @@ class KiwiBotDatasetComplete(Dataset):
         # Goal image = last frame of episode (goal-conditioned)
         last_idx = len(steps) - 1
         goal_step = steps[last_idx]
+        if goal_step is None:
+            raise RuntimeError(f"Episodio {ep_idx}: no se cargó el frame objetivo final.")
         image_goal = _get_primary_image_from_observation(goal_step["observation"])
         image_pil_goal = Image.fromarray(image_goal)
 
@@ -633,9 +747,9 @@ class KiwiBotDatasetComplete(Dataset):
         pixel_values_current = self.image_transform(image_pil_current)
         pixel_values_goal = self.image_transform(image_pil_goal)
 
-        modality_id = 8 # Language + pose. Check _build_multimodal_attention_MMN() in modeling_prismatic.py 
-        action_select_mask = torch.tensor(1.0, dtype=torch.float32)
-        dataset_name = "kiwibot"
+        modality_id = self.modality_id_without_pose
+        action_select_mask = np.array(1.0, dtype=np.float32)
+        dataset_name = self.dataset_name
 
         waypoints_key = "waypoints"  
         cur_wp = current_step.get("observation", {}).get(waypoints_key)
@@ -657,17 +771,16 @@ class KiwiBotDatasetComplete(Dataset):
                     current_compass_deg=0.0,
                     goal_compass_deg=0.0,
                 )
+                modality_id = self.modality_id_with_pose
             else:
-                print("WARN: Not valid goal_pose, setting to NAN")
-                goal_pose = np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float32)
-                obj_pose_norm = np.array([np.nan, np.nan], dtype=np.float32)
+                goal_pose = np.zeros((4,), dtype=np.float32)
+                obj_pose_norm = np.zeros((2,), dtype=np.float32)
         else:
-            print("WARN: Not valid goal_pose, setting to NAN")
-            goal_pose = np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float32)
-            obj_pose_norm = np.array([np.nan, np.nan], dtype=np.float32)
+            goal_pose = np.zeros((4,), dtype=np.float32)
+            obj_pose_norm = np.zeros((2,), dtype=np.float32)
 
         # Temporal distance: number of steps from current to goal frame
-        temp_dist = float(max(0, last_idx - frame_idx))
+        temp_dist = np.array(float(max(0, last_idx - frame_idx)), dtype=np.float32)
 
         return dict(
             pixel_values=pixel_values_current,
@@ -676,7 +789,7 @@ class KiwiBotDatasetComplete(Dataset):
             labels=labels,
             dataset_name=dataset_name,
             modality_id=modality_id,
-            actions=torch.as_tensor(actions),
+            actions=actions.astype(np.float32),
             action_select_mask=action_select_mask,
             goal_pose=goal_pose,
             obj_pose_norm=obj_pose_norm,

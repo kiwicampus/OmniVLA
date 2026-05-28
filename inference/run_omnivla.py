@@ -16,6 +16,7 @@ from typing import Optional, Tuple, Type, Dict
 from dataclasses import dataclass
 
 import numpy as np
+import yaml
 from PIL import Image
 import torch
 import torch.nn as nn
@@ -60,6 +61,38 @@ def load_checkpoint(module_name: str, checkpoint_dir: str, step: int, device: st
 def count_parameters(module: nn.Module, name: str) -> None:
     num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
     print(f"# trainable params in {name}: {num_params}")
+
+def hf_cache_path_to_repo_id(path: str) -> Optional[str]:
+    parts = os.path.normpath(path).split(os.sep)
+    model_parts = [part for part in parts if part.startswith("models--")]
+    if not model_parts:
+        return None
+    return model_parts[-1].removeprefix("models--").replace("--", "/")
+
+def resolve_base_model_path(cfg: "InferenceConfig") -> str:
+    if cfg.base_model_path:
+        return cfg.base_model_path
+
+    resolved_config_path = os.path.join(cfg.checkpoint_dir, "resolved_config.yaml")
+    if os.path.exists(resolved_config_path):
+        with open(resolved_config_path, "r", encoding="utf-8") as handle:
+            train_cfg = yaml.safe_load(handle) or {}
+        model_cfg = train_cfg.get("model", {})
+        base_model = model_cfg.get("requested_vla_path") or model_cfg.get("vla_path")
+        if base_model:
+            return base_model
+
+    adapter_config_path = os.path.join(cfg.checkpoint_dir, "lora_adapter", "adapter_config.json")
+    if os.path.exists(adapter_config_path):
+        with open(adapter_config_path, "r", encoding="utf-8") as handle:
+            adapter_cfg = json.load(handle)
+        base_model = adapter_cfg.get("base_model_name_or_path")
+        if base_model:
+            if os.path.exists(base_model):
+                return base_model
+            return hf_cache_path_to_repo_id(base_model) or base_model
+
+    raise ValueError("Set InferenceConfig.base_model_path or use a checkpoint with resolved_config.yaml/adapter_config.json.")
 
 def init_module(
     module_class: Type[nn.Module],
@@ -484,9 +517,9 @@ class Inference:
 # ===============================================================
 class InferenceConfig:
     resume: bool = True
-    # Path to the base OpenVLA model (HF hub ID or local path).
-    base_model_path: str = "openvla/openvla-7b"
-    # Local path to the checkpoint folder produced by train_omnivla_single_dataset.py.
+    # Leave as None to read the base model from the checkpoint metadata.
+    base_model_path: Optional[str] = None
+    # Local path to the checkpoint folder produced by vla-scripts/train_omnivla.py.
     # It must contain: lora_adapter/, action_head--{step}_checkpoint.pt,
     # pose_projector--{step}_checkpoint.pt, and tokenizer files.
     checkpoint_dir: str = "./checkpoints/openvla-7b+dataset_20260330+b8+lr-2e-05--23500_chkpt"
@@ -500,7 +533,8 @@ class InferenceConfig:
 
 def define_model(cfg: InferenceConfig) -> None:
     cfg.checkpoint_dir = cfg.checkpoint_dir.rstrip("/")
-    print(f"Loading base model from `{cfg.base_model_path}`")
+    base_model_path = resolve_base_model_path(cfg)
+    print(f"Loading base model from `{base_model_path}`")
     print(f"Loading checkpoint from `{cfg.checkpoint_dir}` (step {cfg.resume_step})")
 
     # GPU setup
@@ -527,14 +561,14 @@ def define_model(cfg: InferenceConfig) -> None:
     # Fall back to base model if the checkpoint dir doesn't have a processor config.
     processor_path = cfg.checkpoint_dir if os.path.exists(
         os.path.join(cfg.checkpoint_dir, "processor_config.json")
-    ) else cfg.base_model_path
+    ) else base_model_path
     processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
 
     # Download base model to local cache and load it as our custom class so that
     # OmniVLA-specific methods (e.g. set_num_images_in_input) are available after
     # the LoRA merge. Using AutoModelForVision2Seq with trust_remote_code=True would
     # instantiate the upstream openvla class instead.
-    local_model_path = snapshot_download(repo_id=cfg.base_model_path)
+    local_model_path = base_model_path if os.path.exists(base_model_path) else snapshot_download(repo_id=base_model_path)
     index = json.loads(open(os.path.join(local_model_path, "model.safetensors.index.json")).read())
     state_dict = {}
     for filename in sorted(set(index["weight_map"].values())):

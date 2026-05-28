@@ -1,9 +1,59 @@
-omnivla-finetuned-cast/
+# Python / tooling
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+OmniVLA.egg-info/
+
+# Editors / local agents
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# Environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+
+# Training outputs
+wandb/
+**/wandb/
+runs/
+checkpoints/
+config_nav/runs/
+lightning_logs/
+test_output/
+lerobot_models/
+config_nav/episode_manifests/*.yaml
+!config_nav/episode_manifests/.gitkeep
+
+# Data, caches, and local checkpoints
+/datasets/
+/lerobot_training/
+.cache/
+**/.cache/
+tmp/
+*.log
 omnivla-original/
 omnivla-original-balance/
+omnivla-finetuned-cast/
 MBRA/
 MBRA_BDD/
-OmniVLA.egg-info/
+
+# Old local scratch files kept out of the cleaned training path
 prismatic/vla/datasets/sampler/
 prismatic/vla/datasets/bdd_dataset_.py
 prismatic/vla/datasets/cast_dataset_.py
@@ -18,8 +68,3 @@ config_nav/mbra_and_dataset_config__.yaml
 config_nav/mbra_and_dataset_config_bellman.yaml
 config_nav/base_server_bellman.yaml
 visualization/
-runs/
-# Ignore all __pycache__ directories everywhere
-**/__pycache__/
-# Ignore all wandb directories everywhere
-**/wandb/

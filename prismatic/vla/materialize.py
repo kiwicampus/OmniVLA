@@ -15,7 +15,7 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
-from prismatic.vla.datasets import EpisodicRLDSDataset, RLDSBatchTransform, RLDSDataset
+from .datasets import EpisodicRLDSDataset, RLDSBatchTransform, RLDSDataset
 
 
 def get_vla_dataset_and_collator(

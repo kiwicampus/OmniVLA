@@ -1,130 +1,126 @@
-# OmniVLA: An Omni-Modal Vision-Language-Action Model for Robot Navigation
-[![Python](https://img.shields.io/badge/python-3.10-blue)](https://www.python.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Static Badge](https://img.shields.io/badge/Project-Page-a)](https://omnivla-nav.github.io)
+# OmniVLA
 
+OmniVLA es un modelo Vision-Language-Action para navegacion robotica. Este fork deja una unica ruta estandar para fine-tuning:
 
-[Noriaki Hirose](https://sites.google.com/view/noriaki-hirose/)<sup>1, 2</sup>, [Catherine Glossop](https://catglossop.github.io/)<sup>1</sup>, [Dhruv Shah](https://robodhruv.github.io/)<sup>3</sup>, [Sergey Levine](https://people.eecs.berkeley.edu/~svlevine/)<sup>1</sup>
+- Trainer canonico: `vla-scripts/train_omnivla.py`
+- Config canonica: `config_nav/train_omnivla.yaml`
+- CLI local: `scripts/omnivla_training.sh`
+- Curacion de episodios: `omnivla_training/training_scripts/curate_episodes.py`
+- Inspeccion de dataset: `vla-scripts/inspect_training_dataset.py`
+- Submit opcional a Vertex AI: `omnivla_training/vertex/submit_training_job.py`
+- Guia completa: `TRAINING.md`
 
-<sup>1</sup> UC Berkeley (_Berkeley AI Research_),  <sup>2</sup> Toyota Motor North America, ,  <sup>3</sup> Princeton University
+Los scripts historicos de entrenamiento multi-dataset/MBRA fueron removidos para evitar rutas divergentes. El codigo de inferencia se mantiene en `inference/run_omnivla.py`.
 
-### Installation
-Please set up a conda environment (see instructions in [SETUP.md](SETUP.md)).
+## Instalacion
 
-### Inference
+Para replicar este repo en otro PC:
 
-#### Original paper checkpoints (fully merged models)
-1. Download the original checkpoints and place them in the repo root. "omnivla-original" is the trained checkpoints of the OmniVLA for paper submission. "omnivla-original-balance" contains the trained checkpoints of OmniVLA that account for the data balance in the LeLaN dataset. And "omnivla-finetuned-cast" is finetuned checkpoints with the [CAST](https://huggingface.co/datasets/catglossop/CAST-dataset) dataset.
-    ```
-    git clone https://huggingface.co/NHirose/omnivla-original
-    git clone https://huggingface.co/NHirose/omnivla-original-balance    
-    git clone https://huggingface.co/NHirose/omnivla-finetuned-cast
-    ```
-
-2. Run OmniVLA using a sample current image, goal images, GPS pose, and language prompt. You can view the generated trajectory in the output figure 1_ex.jpg.
-    ```
-    python inference/run_omnivla.py
-    ```
-
-3. Change the goal modality: by default, our code generates actions based on the language prompt. To use a different modality, you can modify the settings around line 560.
-
-4. Run OmniVLA to control the real robot. Modify `run_omnivla.py` to update the robot’s state (camera image, GPS signal) and adjust the goal information accordingly. Then, feed the generated velocity commands to your robot.
-
-#### Fine-tuned checkpoints from `train_omnivla_single_dataset.py` (LoRA format)
-
-Checkpoints produced by `vla-scripts/train_omnivla_single_dataset.py` are **not** fully merged models. Each checkpoint folder contains:
-- `lora_adapter/` — the LoRA adapter weights (applied on top of the base `openvla/openvla-7b`)
-- `action_head--{step}_checkpoint.pt` — the action head MLP
-- `pose_projector--{step}_checkpoint.pt` — the pose projector MLP
-- tokenizer files
-
-To run inference with one of these checkpoints:
-
-1. Download the checkpoint folder from GCS (example for step 23500):
-    ```bash
-    gsutil -m cp -r \
-      "gs://autonomy-vision/training-logs/omnivla/artifacts/Alejoxbg/omnivla-2026-04-02-15-43-15/openvla-7b+dataset_20260330+b8+lr-2e-05--23500_chkpt" \
-      ./checkpoints/
-    ```
-
-2. Update `InferenceConfig` in `inference/run_omnivla.py`:
-    ```python
-    class InferenceConfig:
-        base_model_path: str = "openvla/openvla-7b"   # base model (HF hub or local)
-        checkpoint_dir:  str = "./checkpoints/openvla-7b+dataset_20260330+b8+lr-2e-05--23500_chkpt"
-        resume_step:     int = 23500
-    ```
-
-3. Run inference:
-    ```bash
-    python inference/run_omnivla.py
-    ```
-
-The script will load the base model, apply and fuse the LoRA adapter, then load the action head and pose projector from the checkpoint folder.
-
-### Training
-We provide the training code along with a sample dataloader to help you quickly understand the required data loading structure. Since preparing the full training dataset is resource-intensive, we include this simplified code base for convenience.
-
-1. Downloading MBRA project code base:
-    ```
-    cd ..
-    git clone https://github.com/NHirose/Learning-to-Drive-Anywhere-with-MBRA.git
-    ```
-2. Downloading MBRA model:
-    ```
-    cd OmniVLA_internal
-    git clone https://huggingface.co/NHirose/MBRA/
-    ```
-3. You can set the training or debugging mode at line 10 in vla-scripts/train_omnivla.py. Note that even in debugging mode, the code requires at least 20 GB of GPU memory (we use an NVIDIA RTX 4090).
-
-4. You can configure visualization at line 11 in vla-scripts/train_omnivla.py. During training, it should be set to False.
-    
-5. Training our policy from OpenVLA checkpoints (Please fill X):
-    ```
-    torchrun --standalone --nnodes 1 --nproc-per-node X vla-scripts/train_omnivla.py  --vla_path openvla/openvla-7b --dataset_name omnivla --num_images_in_input 2 --batch_size X --wandb_entity "X" --wandb_project "omnivla"
-    ```
-6. Finetuning our OmniVLA (Please fill X):
-    ```
-    torchrun --standalone --nnodes 1 --nproc-per-node X vla-scripts/train_omnivla.py  --vla_path ./omnivla-original --dataset_name omnivla --num_images_in_input 2 --batch_size X --wandb_entity "X" --wandb_project "omnivla"
-    ````
-7. Memo finetuning our OmniVLA on our large navigation dataset:
-    ```
-    conda activate omnivla_2
-    cd /media/noriaki/Noriaki_Data/OmniVLA
-    torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/train_omnivla_dataset.py  --vla_path ./omnivla-original --dataset_name omnivla --wandb_entity "noriaki-hirose"   --wandb_project "omnivla"
-    ```
-
-### Training with GNM, LeLaN, Frodobots, BDD and CAST datasets
-We provide training code that supports multiple public datasets. Before following the full training process, please first ensure that you can run the example training with the sample dataloader.
-
-1. Downloading all datasets from the original website. ([GNM](https://github.com/robodhruv/visualnav-transformer), [LeLaN](https://github.com/NHirose/learning-language-navigation), [Frodobots](https://github.com/NHirose/Learning-to-Drive-Anywhere-with-MBRA), [CAST](https://openvla-oft.github.io/)) Please verify that the downloaded datasets work properly in their original codebase, except BDD dataset. Note that please download the LeLaN dataset from [this link](https://huggingface.co/datasets/NHirose/LeLaN_dataset_NoMaD_traj/tree/main) instead of [the original link](https://drive.google.com/file/d/1IazHcIyPGO7ENswz8_sGCIGBXF8_sZJK/view). The updated dataset already includes the NoMaD trajectories used for collision-avoidance supervision, you no longer need to compute the NoMaD policy during training. Please carefully follow the usage procedure described in the [LeLaN codebase](https://github.com/NHirose/learning-language-navigation) when working with the dataset.
- 
-2. Downloading the modified BDD dataset with MBRA annotations from [here](https://huggingface.co/datasets/NHirose/BDD_OmniVLA) and extract it. The image sequences in the modified dataset remain subject to the [original BDD license](http://bdd-data.berkeley.edu/download.html), while the additional MBRA annotations are released under the MIT license.
-
-3. Downloading the lerobot code base for the Frodobots dataset dataloader:
-    ```
-    git clone https://github.com/huggingface/lerobot.git 
-    ```
-4. Edit the data path in config_nav/mbra_and_dataset_config.yaml:
-
-5. Training our policy from OpenVLA checkpoints (Please fill X):
-    ```
-    torchrun --standalone --nnodes 1 --nproc-per-node X vla-scripts/train_omnivla_dataset.py  --vla_path ./omnivla-original --dataset_name omnivla --wandb_entity "X"   --wandb_project "omnivla"
-    ```
-       
-In our training setup, we use 8 Nvidia H100 GPUs (80 GB each) across 8 nodes. The batch sizes are configured as [LeLaN, GNM, Frodobots, BDD] = [4, 1, 1, 1], with gradient accumulation set to 4 steps. When finetuning with CAST dataset, we set the batch size as [LeLaN, CAST, GNM, Frodobots, BDD] = [2, 2, 1, 1, 1]. To do so, you need to directly edit train_omnivla_dataset.py.
-    
-### Acknowledgement
-We implement our ideas and design choices on top of the pretrained checkpoints. Our work builds upon the [OpenVLA-OFT](https://openvla-oft.github.io/) codebase, with additional code added to create OmniVLA. As such, our implementation leverages many components of the OpenVLA-OFT codebase. We sincerely appreciate the effort and contributions of the OpenVLA-OFT team!
-
-## Citing
+```bash
+bash scripts/omnivla_training.sh setup
+conda activate omnivla
+bash scripts/omnivla_training.sh doctor
 ```
+
+El setup usa PyTorch CUDA 12.8 por defecto para soportar GPUs Blackwell/RTX 50
+como la RTX 5090. Para GPUs antiguas o drivers viejos puedes fijar otra rueda
+con `TORCH_VERSION`, `TORCHVISION_VERSION`, `TORCHAUDIO_VERSION` y
+`TORCH_INDEX_URL`.
+
+Consulta `TRAINING.md` para el paso a paso completo.
+
+## Entrenamiento rapido
+
+`config_nav/train_omnivla.yaml` viene listo para `robotcom/single_waypoints` como smoke dataset publico y esta comentado campo por campo. Para un dataset real, cambia solo el bloque `dataset`. Luego inspecciona un ejemplo:
+
+```bash
+bash scripts/omnivla_training.sh inspect
+```
+
+Smoke test de un paso:
+
+```bash
+bash scripts/omnivla_training.sh smoke
+```
+
+Antes del smoke test, puedes revisar si la máquina realmente está lista:
+
+```bash
+bash scripts/omnivla_training.sh doctor
+```
+
+Los tests estáticos que no requieren GPU se corren con:
+
+```bash
+bash scripts/omnivla_training.sh check
+```
+
+Entrenamiento completo:
+
+```bash
+bash scripts/omnivla_training.sh train
+```
+
+Todo lo demas, incluyendo que se entrena, como se preparan acciones, checkpoints, Vertex AI, W&B y troubleshooting, esta documentado en `TRAINING.md`.
+
+## Vertex AI rapido
+
+Define tu proyecto, buckets e imagen por variables de entorno; el repo no trae
+IDs internos ni secretos:
+
+```bash
+export VERTEX_PROJECT_ID=<GCP_PROJECT_ID>
+export VERTEX_OMNIVLA_IMAGE_URI=gcr.io/$VERTEX_PROJECT_ID/omnivla-training:latest
+export VERTEX_OMNIVLA_STAGING_BUCKET=gs://<STAGING_BUCKET>/omnivla
+export VERTEX_OMNIVLA_TRAIN_BUCKET=gs://<TRAINING_BUCKET>/omnivla
+
+gcloud builds submit --config omnivla_training/cloudbuild.yaml .
+python omnivla_training/vertex/submit_training_job.py --smoke-test --sync
+```
+
+Para datasets privados, exporta `HF_TOKEN` localmente o usa Secret Manager; no
+lo escribas en archivos del repo.
+
+## Inferencia con checkpoints fine-tuned
+
+Los checkpoints producidos por `vla-scripts/train_omnivla.py` guardan:
+
+- `lora_adapter/`
+- `action_head--{step}_checkpoint.pt`
+- `pose_projector--{step}_checkpoint.pt`
+- `resolved_config.yaml`
+- tokenizer/processor files
+
+`inference/run_omnivla.py` puede leer el modelo base desde `resolved_config.yaml` o desde `lora_adapter/adapter_config.json`, asi que normalmente basta con configurar:
+
+```python
+class InferenceConfig:
+    base_model_path: Optional[str] = None
+    checkpoint_dir: str = "./checkpoints/<checkpoint_dir>"
+    resume_step: int = 23500
+```
+
+## Checkpoints originales
+
+Para usar los modelos publicados del paper:
+
+```bash
+git clone https://huggingface.co/NHirose/omnivla-original
+git clone https://huggingface.co/NHirose/omnivla-original-balance
+git clone https://huggingface.co/NHirose/omnivla-finetuned-cast
+python inference/run_omnivla.py
+```
+
+## Cita
+
+```bibtex
 @misc{hirose2025omnivla,
-      title={OmniVLA: An Omni-Modal Vision-Language-Action Model for Robot Navigation}, 
+      title={OmniVLA: An Omni-Modal Vision-Language-Action Model for Robot Navigation},
       author={Noriaki Hirose and Catherine Glossop and Dhruv Shah and Sergey Levine},
       year={2025},
       eprint={2509.19480},
       archivePrefix={arXiv},
       primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2509.19480}, 
+      url={https://arxiv.org/abs/2509.19480},
 }
+```

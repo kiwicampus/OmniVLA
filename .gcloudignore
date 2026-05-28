@@ -1,0 +1,10 @@
+#!include:.dockerignore
+.claude/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+runs/
+checkpoints/
+lerobot_models/

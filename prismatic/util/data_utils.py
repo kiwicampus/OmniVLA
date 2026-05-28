@@ -27,6 +27,18 @@ def tree_map_with_key(fn: Callable, tree: dict, keys: Sequence = ()) -> dict:
     }
 
 
+def _to_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Convert tensors, numpy arrays and scalars into tensors without assuming a single input type."""
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().clone()
+    elif isinstance(value, np.ndarray):
+        tensor = torch.from_numpy(np.copy(value))
+    else:
+        tensor = torch.as_tensor(value)
+
+    return tensor.to(dtype=dtype) if dtype is not None else tensor
+
+
 @dataclass
 class PaddedCollatorForLanguageModeling:
     model_max_length: int
@@ -102,7 +114,7 @@ class PaddedCollatorForActionPrediction_Nav_MMN:
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        pixel_values = [instance["pixel_values"] for instance in instances]
+        pixel_values = [_to_tensor(instance["pixel_values"], dtype=self.pixel_values_dtype) for instance in instances]
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
@@ -118,43 +130,45 @@ class PaddedCollatorForActionPrediction_Nav_MMN:
 
         # Stack all `pixel_values` --> depending on type is torch.Tensor or Dict[str, torch.Tensor]
         if isinstance(pixel_values[0], torch.Tensor):
-            pixel_values_goal = [instance["pixel_values_goal"] for instance in instances]
-            pixel_values = torch.cat((torch.stack(pixel_values), torch.stack(pixel_values_goal)), dim=1)       
+            pixel_values_goal = [
+                _to_tensor(instance["pixel_values_goal"], dtype=self.pixel_values_dtype) for instance in instances
+            ]
+            pixel_values = torch.cat((torch.stack(pixel_values), torch.stack(pixel_values_goal)), dim=1)
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
         # Stack all actions
-        actions = [torch.from_numpy(np.copy(instance["actions"])) for instance in instances]
+        actions = [_to_tensor(instance["actions"], dtype=torch.float32) for instance in instances]
         actions = torch.stack(actions)
 
         # Stack actin mask
-        action_select_mask = [torch.from_numpy(np.copy(instance["action_select_mask"])) for instance in instances]
+        action_select_mask = [_to_tensor(instance["action_select_mask"], dtype=torch.float32) for instance in instances]
         action_select_mask = torch.stack(action_select_mask)
 
         # Stack goal_pose
-        goal_pose = [torch.from_numpy(np.copy(instance["goal_pose"])) for instance in instances]
+        goal_pose = [_to_tensor(instance["goal_pose"], dtype=torch.float32) for instance in instances]
         goal_pose = torch.stack(goal_pose)
 
         # Stack obj_pose
-        obj_pose_norm = [torch.from_numpy(np.copy(instance["obj_pose_norm"])) for instance in instances]
+        obj_pose_norm = [_to_tensor(instance["obj_pose_norm"], dtype=torch.float32) for instance in instances]
         obj_pose_norm = torch.stack(obj_pose_norm)
 
         # Stack cur_image
-        cur_image = [torch.from_numpy(np.copy(instance["cur_image"])) for instance in instances]
+        cur_image = [_to_tensor(instance["cur_image"], dtype=torch.float32) for instance in instances]
         cur_image = torch.stack(cur_image)
 
         # Stack goal_image_8
-        goal_image_8 = [torch.from_numpy(np.copy(instance["goal_image_8"])) for instance in instances]
+        goal_image_8 = [_to_tensor(instance["goal_image_8"], dtype=torch.float32) for instance in instances]
         goal_image_8 = torch.stack(goal_image_8)
 
         # Stack temp_dist
-        temp_dist = [torch.from_numpy(np.copy(instance["temp_dist"])) for instance in instances]
+        temp_dist = [_to_tensor(instance["temp_dist"], dtype=torch.float32) for instance in instances]
         temp_dist = torch.stack(temp_dist)
         
         # Stack proprio
         if "proprio" in instances[0]:
-            proprio = [instance["proprio"] for instance in instances]
-            proprio = torch.Tensor(np.squeeze(np.stack(proprio)))
+            proprio = [_to_tensor(instance["proprio"], dtype=torch.float32) for instance in instances]
+            proprio = torch.stack(proprio)
         else:
             proprio = None
         #print(input_ids.size(), labels.size())
