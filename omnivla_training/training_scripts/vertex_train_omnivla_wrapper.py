@@ -18,6 +18,7 @@ from typing import Dict, Optional, Tuple
 import yaml
 from google.cloud import storage
 from huggingface_hub import login
+from omnivla_training.checkpoint_utils import checkpoint_step
 from omnivla_training.vertex import utils as vertex_utils
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -374,14 +375,13 @@ def prune_local_checkpoints(run_root: Path, keep_last: int) -> None:
     if keep_last < 0 or not run_root.exists():
         return
 
-    checkpoint_pattern = re.compile(r"--(\d+)_chkpt$")
     checkpoint_dirs = []
     for path in run_root.iterdir():
         if not path.is_dir():
             continue
-        match = checkpoint_pattern.search(path.name)
-        if match:
-            checkpoint_dirs.append((int(match.group(1)), path))
+        step = checkpoint_step(path)
+        if step is not None:
+            checkpoint_dirs.append((step, path))
 
     checkpoint_dirs.sort(key=lambda item: item[0])
     for _, stale_path in checkpoint_dirs[:-keep_last]:
