@@ -467,10 +467,26 @@ Cada checkpoint contiene:
 - `lora_adapter/`: pesos LoRA y `adapter_config.json`.
 - `action_head--{step}_checkpoint.pt`: head continuo.
 - `pose_projector--{step}_checkpoint.pt`: projector de pose.
+- `training_state--{step}_checkpoint.pt`: estado del optimizer, del scheduler y el `global_step`.
 - `resolved_config.yaml`: config final, incluyendo el modelo base pedido y el path resuelto.
+- `_CHECKPOINT_COMPLETE`: marcador vacio, escrito al final, despues de que todo lo anterior ya quedo en disco. Un checkpoint sin este archivo esta incompleto (por ejemplo, interrumpido a mitad de guardado por una preemption de Spot) y no debe usarse para reanudar.
 - archivos del tokenizer/processor.
 
 Por defecto `merge_lora_during_training: false`. Esto evita un merge caro durante training. La inferencia fusiona LoRA al cargar.
+
+### Reanudar un run interrumpido
+
+```bash
+python vla-scripts/train_omnivla.py --config config_nav/train_omnivla.yaml \
+  --resume-from runs/omnivla_train/omnivla-original+my_dataset+b8+lr-2e-05--5000_chkpt
+```
+
+Esto recarga el adapter LoRA, `pose_projector`, `action_head`, y el estado del
+optimizer/scheduler desde ese checkpoint, y continua el conteo de pasos desde
+ahi en vez de reiniciar `global_step` en 0. El trainer se niega a reanudar
+desde un checkpoint sin `_CHECKPOINT_COMPLETE`. Antes de esto, un run
+interrumpido siempre reiniciaba desde `model.vla_path`, descartando todo el
+progreso guardado.
 
 ## Inferencia desde un checkpoint
 

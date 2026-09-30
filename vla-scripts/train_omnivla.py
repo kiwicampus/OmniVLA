@@ -45,6 +45,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from omnivla_training.checkpoint_utils import CHECKPOINT_COMPLETE_FILE, checkpoint_step
 from omnivla_training.episode_manifest import load_episode_subset
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction_MMNv1
@@ -156,6 +157,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune OmniVLA through the canonical single-dataset route.")
     parser.add_argument("--config", type=Path, required=True, help="Path to YAML config.")
     parser.add_argument("--smoke-test", action="store_true", help="Build the pipeline and run a single optimizer step.")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help=(
+            "A `<run_dir>--<step>_chkpt` directory to resume from: reloads the LoRA "
+            "adapter, pose_projector, action_head, optimizer/scheduler state, and "
+            "continues from that step instead of starting fresh from `model.vla_path`."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -395,6 +406,8 @@ def save_training_checkpoint(
     processor: Any,
     pose_projector: torch.nn.Module,
     action_head: torch.nn.Module,
+    optimizer: AdamW,
+    scheduler: LambdaLR,
     distributed_state: PartialState,
 ) -> None:
     checkpoint_cfg = cfg["checkpoint"]
@@ -424,6 +437,14 @@ def save_training_checkpoint(
         (checkpoint_dir / "resolved_config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         torch.save(unwrap(pose_projector).state_dict(), checkpoint_dir / f"pose_projector--{checkpoint_name_suffix}")
         torch.save(unwrap(action_head).state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
+        torch.save(
+            {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "global_step": global_step,
+            },
+            checkpoint_dir / f"training_state--{checkpoint_name_suffix}",
+        )
 
     ddp_barrier()
 
@@ -439,6 +460,13 @@ def save_training_checkpoint(
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
         ddp_barrier()
+
+    # Written last, after every artifact above has landed, so a partially
+    # written checkpoint (killed mid-save, e.g. by Spot preemption) is never
+    # mistaken for a resumable one.
+    if distributed_state.is_main_process:
+        (checkpoint_dir / CHECKPOINT_COMPLETE_FILE).touch()
+    ddp_barrier()
 
 
 def load_vla_and_processor(
@@ -490,6 +518,14 @@ def load_vla_and_processor(
 
     vla.vision_backbone.set_num_images_in_input(int(model_cfg.get("num_images_in_input", 2)))
     vla.to(dtype=torch.bfloat16, device=device)
+
+    if model_cfg.get("enable_gradient_checkpointing", False):
+        # enable_input_require_grads() is required alongside checkpointing once LoRA
+        # freezes the base model: checkpointing needs at least one input on the
+        # recomputed path to require grad, and a frozen embedding layer won't.
+        vla.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        vla.enable_input_require_grads()
+
     return vla_path, vla, processor
 
 
@@ -504,9 +540,24 @@ def build_run_id(cfg: Dict[str, Any], dataset_cfg: Dict[str, Any]) -> str:
     )
 
 
-def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool) -> None:
+def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from: Optional[Path] = None) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for OmniVLA training.")
+
+    resolved_resume_from = resolve_local_path(str(resume_from), config_path) if resume_from else None
+    resume_step = 0
+    if resolved_resume_from is not None:
+        if not (resolved_resume_from / CHECKPOINT_COMPLETE_FILE).exists():
+            raise ValueError(
+                f"Resume checkpoint {resolved_resume_from} is missing `{CHECKPOINT_COMPLETE_FILE}`; "
+                "it is incomplete, or from a version of this trainer that predates checkpoint resume."
+            )
+        resume_step = checkpoint_step(resolved_resume_from)
+        if resume_step is None:
+            raise ValueError(
+                f"Cannot parse a step number from `{resolved_resume_from.name}`; "
+                "expected a `--<step>_chkpt` suffix."
+            )
 
     dataset_cfg = cfg["dataset"]
     model_cfg = cfg["model"]
@@ -553,30 +604,38 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool) -> None:
     if not model_cfg.get("use_lora", True):
         raise ValueError("The canonical OmniVLA trainer saves LoRA adapters; keep `model.use_lora: true`.")
 
-    target_modules = [name for name, module in vla.named_modules() if isinstance(module, torch.nn.Linear)]
-    lora_config = LoraConfig(
-        r=int(model_cfg.get("lora_rank", 32)),
-        lora_alpha=min(int(model_cfg.get("lora_rank", 32)), 16),
-        lora_dropout=float(model_cfg.get("lora_dropout", 0.0)),
-        target_modules=target_modules,
-        init_lora_weights="gaussian",
-    )
-    vla = get_peft_model(vla, lora_config)
+    if resolved_resume_from is not None:
+        vla = PeftModel.from_pretrained(vla, resolved_resume_from / "lora_adapter", is_trainable=True)
+        print(f"Resumed LoRA adapter from {resolved_resume_from} at step {resume_step}")
+    else:
+        target_modules = [name for name, module in vla.named_modules() if isinstance(module, torch.nn.Linear)]
+        lora_config = LoraConfig(
+            r=int(model_cfg.get("lora_rank", 32)),
+            lora_alpha=min(int(model_cfg.get("lora_rank", 32)), 16),
+            lora_dropout=float(model_cfg.get("lora_dropout", 0.0)),
+            target_modules=target_modules,
+            init_lora_weights="gaussian",
+        )
+        vla = get_peft_model(vla, lora_config)
     vla.print_trainable_parameters()
 
     vla = wrap_ddp(vla, device_id)
-    pose_projector = wrap_ddp(
-        ProprioProjector(llm_dim=unwrap(vla).llm_dim, proprio_dim=POSE_DIM).to(device),
-        device_id,
-    )
-    action_head = wrap_ddp(
-        L1RegressionActionHead_idcat(
-            input_dim=unwrap(vla).llm_dim,
-            hidden_dim=unwrap(vla).llm_dim,
-            action_dim=ACTION_DIM,
-        ).to(device=device, dtype=torch.bfloat16),
-        device_id,
-    )
+    pose_projector = ProprioProjector(llm_dim=unwrap(vla).llm_dim, proprio_dim=POSE_DIM).to(device)
+    action_head = L1RegressionActionHead_idcat(
+        input_dim=unwrap(vla).llm_dim,
+        hidden_dim=unwrap(vla).llm_dim,
+        action_dim=ACTION_DIM,
+    ).to(device=device, dtype=torch.bfloat16)
+    if resolved_resume_from is not None:
+        pose_projector.load_state_dict(
+            torch.load(resolved_resume_from / f"pose_projector--{resume_step}_checkpoint.pt", map_location=device)
+        )
+        action_head.load_state_dict(
+            torch.load(resolved_resume_from / f"action_head--{resume_step}_checkpoint.pt", map_location=device)
+        )
+        print(f"Resumed pose_projector and action_head from {resolved_resume_from}")
+    pose_projector = wrap_ddp(pose_projector, device_id)
+    action_head = wrap_ddp(action_head, device_id)
 
     print(f"Trainable VLA params: {count_trainable_parameters(vla)}")
     print(f"Trainable pose projector params: {count_trainable_parameters(pose_projector)}")
@@ -599,6 +658,13 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool) -> None:
         weight_decay=weight_decay,
     )
     scheduler = build_lr_scheduler(optimizer, training_cfg)
+    if resolved_resume_from is not None:
+        training_state = torch.load(
+            resolved_resume_from / f"training_state--{resume_step}_checkpoint.pt", map_location=device
+        )
+        optimizer.load_state_dict(training_state["optimizer"])
+        scheduler.load_state_dict(training_state["scheduler"])
+        print(f"Resumed optimizer/scheduler state from {resolved_resume_from}")
 
     action_tokenizer = ActionTokenizer(processor.tokenizer)
     collator = PaddedCollatorForActionPrediction_Nav_MMN(
@@ -681,13 +747,15 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool) -> None:
     action_head.train()
     optimizer.zero_grad()
 
-    global_step = 0
+    global_step = resume_step
     micro_step = 0
     epoch = 0
     sampler.set_epoch(epoch)
     train_iter = iter(train_loader)
 
-    with tqdm.tqdm(total=max_steps, disable=not distributed_state.is_main_process) as progress:
+    with tqdm.tqdm(
+        total=max_steps, initial=global_step, disable=not distributed_state.is_main_process
+    ) as progress:
         while global_step < max_steps:
             try:
                 batch = next(train_iter)
@@ -786,6 +854,8 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool) -> None:
                     processor=processor,
                     pose_projector=pose_projector,
                     action_head=action_head,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
                     distributed_state=distributed_state,
                 )
 
@@ -798,6 +868,8 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool) -> None:
             processor=processor,
             pose_projector=pose_projector,
             action_head=action_head,
+            optimizer=optimizer,
+            scheduler=scheduler,
             distributed_state=distributed_state,
         )
 
@@ -808,7 +880,7 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool) -> None:
 def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
-    train(cfg, args.config.resolve(), args.smoke_test)
+    train(cfg, args.config.resolve(), args.smoke_test, resume_from=args.resume_from)
     return 0
 
 
