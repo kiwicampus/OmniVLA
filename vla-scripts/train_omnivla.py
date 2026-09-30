@@ -518,6 +518,14 @@ def load_vla_and_processor(
 
     vla.vision_backbone.set_num_images_in_input(int(model_cfg.get("num_images_in_input", 2)))
     vla.to(dtype=torch.bfloat16, device=device)
+
+    if model_cfg.get("enable_gradient_checkpointing", False):
+        # enable_input_require_grads() is required alongside checkpointing once LoRA
+        # freezes the base model: checkpointing needs at least one input on the
+        # recomputed path to require grad, and a frozen embedding layer won't.
+        vla.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        vla.enable_input_require_grads()
+
     return vla_path, vla, processor
 
 
