@@ -36,7 +36,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -47,6 +47,7 @@ if str(ROOT) not in sys.path:
 
 from omnivla_training.checkpoint_utils import CHECKPOINT_COMPLETE_FILE, checkpoint_step
 from omnivla_training.episode_manifest import load_episode_subset
+from omnivla_training.turn_sampling import turn_sample_weights
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction_MMNv1
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -258,6 +259,32 @@ def unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if hasattr(module, "module") else module
 
 
+class EpochWeightedSampler(WeightedRandomSampler):
+    """Weighted sampling with the `set_epoch` the training loop calls on every sampler."""
+
+    def __init__(self, weights: Any, num_samples: int, seed: int = 0) -> None:
+        super().__init__(
+            torch.as_tensor(weights, dtype=torch.double), num_samples, replacement=True, generator=torch.Generator()
+        )
+        self.seed = seed
+        self.set_epoch(0)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.generator.manual_seed(self.seed + epoch)
+
+
+def load_head_state(
+    checkpoint_dir: Path, names: Tuple[str, ...], step: int, device: torch.device
+) -> Dict[str, torch.Tensor]:
+    """Load the first `<name>--<step>_checkpoint.pt` that exists, minus any DDP prefix."""
+    for name in names:
+        path = checkpoint_dir / f"{name}--{step}_checkpoint.pt"
+        if path.exists():
+            state = torch.load(path, map_location=device)
+            return {key.removeprefix("module."): value for key, value in state.items()}
+    raise FileNotFoundError(f"none of {names} for step {step} in {checkpoint_dir}")
+
+
 def count_trainable_parameters(module: torch.nn.Module) -> int:
     return sum(param.numel() for param in module.parameters() if param.requires_grad)
 
@@ -324,6 +351,7 @@ def run_forward_pass(
     num_patches: int,
     obj_loss_weight: float,
     smoothness_loss_weight: float,
+    action_dim_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     ground_truth_actions = batch["actions"].to(device=device, dtype=torch.bfloat16)
     modality_id = batch["goal_mask_select"].to(device=device, dtype=torch.long).reshape(-1)
@@ -363,6 +391,8 @@ def run_forward_pass(
         )
 
         action_loss = torch.nn.functional.mse_loss(predicted_actions, ground_truth_actions)
+        if action_dim_weights is not None:
+            action_loss = (((predicted_actions - ground_truth_actions) ** 2) * action_dim_weights).mean()
         action_l1 = torch.nn.functional.l1_loss(predicted_actions, ground_truth_actions)
         final_action_l1 = torch.nn.functional.l1_loss(predicted_actions[:, -1], ground_truth_actions[:, -1])
         final_xy_l1 = torch.nn.functional.l1_loss(predicted_actions[:, -1, 0:2], ground_truth_actions[:, -1, 0:2])
@@ -604,9 +634,18 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
     if not model_cfg.get("use_lora", True):
         raise ValueError("The canonical OmniVLA trainer saves LoRA adapters; keep `model.use_lora: true`.")
 
-    if resolved_resume_from is not None:
-        vla = PeftModel.from_pretrained(vla, resolved_resume_from / "lora_adapter", is_trainable=True)
-        print(f"Resumed LoRA adapter from {resolved_resume_from} at step {resume_step}")
+    # A resume wins; `model.init_from` only seeds weights and starts the schedule at step 0.
+    weights_from, weights_step = resolved_resume_from, resume_step
+    init_from = resolve_local_path(model_cfg.get("init_from"), config_path)
+    if weights_from is None and init_from is not None:
+        weights_from = init_from
+        weights_step = model_cfg.get("init_step") or checkpoint_step(init_from)
+        if weights_step is None:
+            raise ValueError(f"Set `model.init_step`: cannot parse a step from `{init_from.name}`.")
+
+    if weights_from is not None:
+        vla = PeftModel.from_pretrained(vla, weights_from / "lora_adapter", is_trainable=True)
+        print(f"Loaded LoRA adapter from {weights_from} at step {weights_step}")
     else:
         target_modules = [name for name, module in vla.named_modules() if isinstance(module, torch.nn.Linear)]
         lora_config = LoraConfig(
@@ -626,14 +665,13 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
         hidden_dim=unwrap(vla).llm_dim,
         action_dim=ACTION_DIM,
     ).to(device=device, dtype=torch.bfloat16)
-    if resolved_resume_from is not None:
+    if weights_from is not None:
+        # The original release names the pose projector `proprio_projector`.
         pose_projector.load_state_dict(
-            torch.load(resolved_resume_from / f"pose_projector--{resume_step}_checkpoint.pt", map_location=device)
+            load_head_state(weights_from, ("pose_projector", "proprio_projector"), weights_step, device)
         )
-        action_head.load_state_dict(
-            torch.load(resolved_resume_from / f"action_head--{resume_step}_checkpoint.pt", map_location=device)
-        )
-        print(f"Resumed pose_projector and action_head from {resolved_resume_from}")
+        action_head.load_state_dict(load_head_state(weights_from, ("action_head",), weights_step, device))
+        print(f"Loaded pose_projector and action_head from {weights_from}")
     pose_projector = wrap_ddp(pose_projector, device_id)
     action_head = wrap_ddp(action_head, device_id)
 
@@ -702,7 +740,25 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
             f"({effective_batch_size}). Reduce `training.batch_size` or increase the dataset subset."
         )
 
-    sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=device_id, shuffle=True)
+    turn_boost = float(training_cfg.get("turn_oversample", 0))
+    if turn_boost > 1:
+        if world_size != 1:
+            raise ValueError("`training.turn_oversample` supports a single process only.")
+        sample_weights = turn_sample_weights(
+            resolved_dataset_root / "data",
+            train_dataset._index,
+            NUM_ACTIONS_CHUNK,
+            float(training_cfg.get("turn_rate_threshold", 0.3)),
+            turn_boost,
+        )
+        turning_share = float((sample_weights > 1).mean())
+        print(
+            f"Turn oversampling x{turn_boost:g}: {turning_share:.1%} of frames turn, "
+            f"about {turning_share * turn_boost / (1 + turning_share * (turn_boost - 1)):.1%} of samples drawn"
+        )
+        sampler = EpochWeightedSampler(sample_weights, len(train_dataset), seed=int(training_cfg.get("seed", 0)))
+    else:
+        sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=device_id, shuffle=True)
     num_workers = int(dataset_cfg.get("num_workers", 4))
     train_loader = DataLoader(
         train_dataset,
@@ -742,6 +798,13 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
     }
     step_metric_sums = {key: 0.0 for key in metric_names}
 
+    dim_weights_cfg = training_cfg.get("action_dim_weights")
+    action_dim_weights = None
+    if dim_weights_cfg is not None:
+        if len(dim_weights_cfg) != ACTION_DIM:
+            raise ValueError(f"`training.action_dim_weights` needs {ACTION_DIM} values, got {dim_weights_cfg}.")
+        action_dim_weights = torch.tensor(dim_weights_cfg, device=device, dtype=torch.bfloat16)
+
     vla.train()
     pose_projector.train()
     action_head.train()
@@ -775,6 +838,7 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
                 num_patches=num_patches,
                 obj_loss_weight=float(training_cfg.get("object_loss_weight", 0.1)),
                 smoothness_loss_weight=float(training_cfg.get("smoothness_loss_weight", 0.1)),
+                action_dim_weights=action_dim_weights,
             )
 
             (loss / grad_accumulation_steps).backward()
