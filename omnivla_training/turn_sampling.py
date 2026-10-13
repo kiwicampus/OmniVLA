@@ -13,19 +13,12 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pads
 
 
-def turn_sample_weights(
-    data_dir: Path,
-    index: Sequence[Tuple[int, int]],
-    width: int,
-    rate_threshold: float,
-    boost: float,
-) -> np.ndarray:
-    """Return `boost` for each (episode, frame) whose next `width` frames turn, else 1.
-
-    A frame turns when |mean angular.z| over frames i..i+width-1 exceeds `rate_threshold`.
-    """
+def turn_rates(data_dir: Path, index: Sequence[Tuple[int, int]], width: int) -> np.ndarray:
+    """Mean angular.z over frames i..i+width-1 for each (episode, frame) in `index`."""
+    keys = np.asarray(index, dtype=np.int64).reshape(-1, 2)
     table = pads.dataset(data_dir, format="parquet").to_table(
-        columns=["episode_index", "frame_index", "action"]
+        columns=["episode_index", "frame_index", "action"],
+        filter=pads.field("episode_index").isin(np.unique(keys[:, 0]).tolist()),
     )
     episode = table["episode_index"].to_numpy()
     frame = table["frame_index"].to_numpy()
@@ -44,7 +37,15 @@ def turn_sample_weights(
     ends = np.minimum(rows + width, row_start + np.repeat(lengths, lengths))
     csum = np.concatenate([[0.0], np.cumsum(yaw_rate)])
     mean_rate = (csum[ends] - csum[rows]) / (ends - rows)
+    return mean_rate[starts[np.searchsorted(episode[starts], keys[:, 0])] + keys[:, 1]]
 
-    keys = np.asarray(index, dtype=np.int64).reshape(-1, 2)
-    position = starts[np.searchsorted(episode[starts], keys[:, 0])] + keys[:, 1]
-    return np.where(np.abs(mean_rate[position]) > rate_threshold, float(boost), 1.0)
+
+def turn_sample_weights(
+    data_dir: Path,
+    index: Sequence[Tuple[int, int]],
+    width: int,
+    rate_threshold: float,
+    boost: float,
+) -> np.ndarray:
+    """`boost` for each (episode, frame) whose |turn rate| exceeds `rate_threshold`, else 1."""
+    return np.where(np.abs(turn_rates(data_dir, index, width)) > rate_threshold, float(boost), 1.0)

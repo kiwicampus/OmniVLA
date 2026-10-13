@@ -259,20 +259,6 @@ def unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if hasattr(module, "module") else module
 
 
-class EpochWeightedSampler(WeightedRandomSampler):
-    """Weighted sampling with the `set_epoch` the training loop calls on every sampler."""
-
-    def __init__(self, weights: Any, num_samples: int, seed: int = 0) -> None:
-        super().__init__(
-            torch.as_tensor(weights, dtype=torch.double), num_samples, replacement=True, generator=torch.Generator()
-        )
-        self.seed = seed
-        self.set_epoch(0)
-
-    def set_epoch(self, epoch: int) -> None:
-        self.generator.manual_seed(self.seed + epoch)
-
-
 def load_head_state(
     checkpoint_dir: Path, names: Tuple[str, ...], step: int, device: torch.device
 ) -> Dict[str, torch.Tensor]:
@@ -758,7 +744,7 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
             f"Turn oversampling x{turn_boost:g}: {turning_share:.1%} of frames turn, "
             f"about {turning_share * turn_boost / (1 + turning_share * (turn_boost - 1)):.1%} of samples drawn"
         )
-        sampler = EpochWeightedSampler(sample_weights, len(train_dataset), seed=int(training_cfg.get("seed", 0)))
+        sampler = WeightedRandomSampler(torch.as_tensor(sample_weights, dtype=torch.double), len(train_dataset))
     else:
         sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=device_id, shuffle=True)
     num_workers = int(dataset_cfg.get("num_workers", 4))
@@ -815,7 +801,8 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
     global_step = resume_step
     micro_step = 0
     epoch = 0
-    sampler.set_epoch(epoch)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
     train_iter = iter(train_loader)
 
     with tqdm.tqdm(
@@ -826,7 +813,8 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
                 batch = next(train_iter)
             except StopIteration:
                 epoch += 1
-                sampler.set_epoch(epoch)
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
 
