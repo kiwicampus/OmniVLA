@@ -19,6 +19,7 @@ from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
 
+from omnivla_training.gps_course import course_heading_deg
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
@@ -410,6 +411,13 @@ def _get_primary_image_from_observation(observation: Dict[str, Any]) -> np.ndarr
         raise ValueError(f"Expected image shape (H, W, C), got {out.shape}")
     return out
 
+COURSE_BACK_FRAMES = 15  # 1.5 s at 10 Hz
+
+
+class _NoCourse(Exception):
+    """The robot was too still, or a GPS fix was missing, to tell its heading."""
+
+
 class KiwiBotDatasetComplete(Dataset):
     """
     Map-style Dataset that loads LeRobot-format data and returns the same structure as Dummy_Dataset
@@ -441,6 +449,8 @@ class KiwiBotDatasetComplete(Dataset):
         video_backend: str = "pyav",
         tolerance_s: Optional[float] = None,
         max_decode_retries: int = 8,
+        goal_ahead_frames: Optional[Tuple[int, int]] = None,
+        gps_heading: bool = False,
     ):
         LeRobotDataset, LeRobotDatasetMetadata = _import_lerobot_dataset_classes()
         self.src_dir = Path(src_dir)
@@ -460,6 +470,10 @@ class KiwiBotDatasetComplete(Dataset):
         self.modality_id_with_pose = int(modality_id_with_pose)
         self.modality_id_without_pose = int(modality_id_without_pose)
         self.video_backend = video_backend
+        # (min, max) frames ahead for the goal image and GPS goal; None keeps the last frame.
+        self.goal_ahead_frames = None if goal_ahead_frames is None else tuple(int(v) for v in goal_ahead_frames)
+        # True: the heading comes from the GPS track over the last COURSE_BACK_FRAMES, not 0.
+        self.gps_heading = bool(gps_heading)
         self.tolerance_s = None if tolerance_s is None else float(tolerance_s)
         self.max_decode_retries = max(1, int(max_decode_retries))
         self._LeRobotDataset = LeRobotDataset 
@@ -579,12 +593,28 @@ class KiwiBotDatasetComplete(Dataset):
         steps_with_idx.sort(key=lambda x: x[0])
         return [s for _, s in steps_with_idx]
 
+    def _goal_idx(self, episode_index: int, frame_idx: int) -> int:
+        """Goal frame: the episode's last frame, or a fixed pseudo-random distance ahead of frame_idx."""
+        last_idx = self._episode_lengths[episode_index] - 1
+        if self.goal_ahead_frames is None:
+            return last_idx
+        ahead = random.Random(episode_index * 1_000_003 + frame_idx).randint(*self.goal_ahead_frames)
+        return min(frame_idx + ahead, last_idx)
+
+    def _course_at(self, steps: List[Optional[Dict[str, Any]]], idx: int) -> Optional[float]:
+        past = steps[max(0, idx - COURSE_BACK_FRAMES)]["observation"].get("waypoints")
+        now = steps[idx]["observation"].get("waypoints")
+        if past is None or now is None:
+            return None
+        return course_heading_deg(np.reshape(past, -1)[:2], np.reshape(now, -1)[:2])
+
     def _load_episode_steps_at_frames(
-        self, episode_index: int, frame_idx: int
+        self, episode_index: int, frame_idx: int, goal_idx: Optional[int] = None
     ) -> List[Optional[Dict[str, Any]]]:
         """Load only the frames needed for __getitem__(episode_index, frame_idx). Returns list of length L with None for unloaded."""
         L = self._episode_lengths.get(episode_index, 0)
         last_idx = L - 1
+        goal_idx = last_idx if goal_idx is None else goal_idx
 
         if frame_idx + (NUM_ACTIONS_CHUNK - 1) * self.action_spacing < L:
             effective_spacing = self.action_spacing
@@ -592,7 +622,9 @@ class KiwiBotDatasetComplete(Dataset):
             effective_spacing = 1
         indices_to_load = set()
         indices_to_load.add(frame_idx)
-        indices_to_load.add(last_idx)
+        indices_to_load.add(goal_idx)
+        if self.gps_heading:
+            indices_to_load.update(max(0, i - COURSE_BACK_FRAMES) for i in (frame_idx, goal_idx))
         for k in range(NUM_ACTIONS_CHUNK):
             indices_to_load.add(min(frame_idx + k * effective_spacing, last_idx))
         for offset in range(self.context_size + 1): #For MBRA
@@ -650,8 +682,16 @@ class KiwiBotDatasetComplete(Dataset):
         for attempt in range(self.max_decode_retries):
             ep_idx, frame_idx = self._index[candidate_idx]
             try:
-                steps = self._load_episode_steps_at_frames(ep_idx, frame_idx)
+                goal_idx = self._goal_idx(ep_idx, frame_idx)
+                steps = self._load_episode_steps_at_frames(ep_idx, frame_idx, goal_idx)
+                headings = (0.0, 0.0)
+                if self.gps_heading:
+                    headings = (self._course_at(steps, frame_idx), self._course_at(steps, goal_idx))
+                    if None in headings:
+                        raise _NoCourse()
                 break
+            except _NoCourse:
+                candidate_idx = self._fallback_index(idx, attempt)
             except Exception as exc:
                 if not self._is_skippable_decode_error(exc):
                     raise
@@ -678,8 +718,7 @@ class KiwiBotDatasetComplete(Dataset):
 
 
         # Goal image = last frame of episode (goal-conditioned)
-        last_idx = len(steps) - 1
-        goal_step = steps[last_idx]
+        goal_step = steps[goal_idx]
         if goal_step is None:
             raise RuntimeError(f"Episodio {ep_idx}: no se cargó el frame objetivo final.")
         image_goal = _get_primary_image_from_observation(goal_step["observation"])
@@ -768,8 +807,8 @@ class KiwiBotDatasetComplete(Dataset):
                 goal_lon, goal_lat = float(goal_flat[0]), float(goal_flat[1])
                 goal_pose, obj_pose_norm = self._goal_pose_from_waypoints(
                     current_lon, current_lat, goal_lon, goal_lat,
-                    current_compass_deg=0.0,
-                    goal_compass_deg=0.0,
+                    current_compass_deg=headings[0],
+                    goal_compass_deg=headings[1],
                 )
                 modality_id = self.modality_id_with_pose
             else:
@@ -780,7 +819,7 @@ class KiwiBotDatasetComplete(Dataset):
             obj_pose_norm = np.zeros((2,), dtype=np.float32)
 
         # Temporal distance: number of steps from current to goal frame
-        temp_dist = np.array(float(max(0, last_idx - frame_idx)), dtype=np.float32)
+        temp_dist = np.array(float(max(0, goal_idx - frame_idx)), dtype=np.float32)
 
         return dict(
             pixel_values=pixel_values_current,
