@@ -142,3 +142,7 @@ python inference/run_omnivla.py
       url={https://arxiv.org/abs/2509.19480},
 }
 ```
+
+## Inferencia OmniVLA-edge
+
+Viene del repo original (NHirose/OmniVLA). Descarga `git clone https://huggingface.co/NHirose/omnivla-edge` y corre `python inference/run_omnivla_edge.py`; edita ese script para dar la imagen, el GPS y el prompt.
