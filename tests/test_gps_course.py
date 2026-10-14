@@ -1,6 +1,6 @@
 import unittest
 
-from omnivla_training.gps_course import course_heading_deg
+from omnivla_training.gps_course import course_at, course_heading_deg
 
 LAT, LON = 4.6, -74.07
 STEP = 0.0001  # about 11 m
@@ -21,6 +21,13 @@ class GpsCourseTests(unittest.TestCase):
         self.assertIsNone(course_heading_deg([LON, LAT], [LON, LAT + 1e-6]))
         self.assertIsNone(course_heading_deg([float("nan"), LAT], [LON, LAT + STEP]))
         self.assertIsNone(course_heading_deg([], [LON, LAT]))
+
+
+    def test_course_at_reads_the_fix_back_frames_earlier(self):
+        rows = [{"observation.state.waypoints": [LON, LAT + i * 0.00001]} for i in range(40)]
+        self.assertLess(_gap(course_at(rows, 30, 15), 0), 2)
+        self.assertIsNone(course_at(rows, 0, 15))
+        self.assertIsNone(course_at([{}, {}], 1, 1))
 
 
 if __name__ == "__main__":

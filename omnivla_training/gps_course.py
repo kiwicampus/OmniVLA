@@ -26,3 +26,11 @@ def course_heading_deg(
     if math.hypot(move_e, move_n) < min_move:
         return None
     return math.degrees(math.atan2(move_e, move_n)) % 360.0
+
+
+def course_at(rows, idx: int, back: int, key: str = "observation.state.waypoints") -> Optional[float]:
+    """Course heading at frame `idx` from the fix `back` frames earlier; `rows` indexes like a HF dataset."""
+    past, now = rows[max(0, idx - back)].get(key), rows[idx].get(key)
+    if past is None or now is None:
+        return None
+    return course_heading_deg(np.reshape(np.asarray(past, float), -1)[:2], np.reshape(np.asarray(now, float), -1)[:2])

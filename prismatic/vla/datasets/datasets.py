@@ -19,7 +19,7 @@ from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
 
-from omnivla_training.gps_course import course_heading_deg
+from omnivla_training.gps_course import course_at
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
@@ -601,16 +601,9 @@ class KiwiBotDatasetComplete(Dataset):
         ahead = random.Random(episode_index * 1_000_003 + frame_idx).randint(*self.goal_ahead_frames)
         return min(frame_idx + ahead, last_idx)
 
-    def _course_at(self, steps: List[Optional[Dict[str, Any]]], idx: int) -> Optional[float]:
-        past = steps[max(0, idx - COURSE_BACK_FRAMES)]["observation"].get("waypoints")
-        now = steps[idx]["observation"].get("waypoints")
-        if past is None or now is None:
-            return None
-        return course_heading_deg(np.reshape(past, -1)[:2], np.reshape(now, -1)[:2])
-
     def _load_episode_steps_at_frames(
         self, episode_index: int, frame_idx: int, goal_idx: Optional[int] = None
-    ) -> List[Optional[Dict[str, Any]]]:
+    ) -> Tuple[List[Optional[Dict[str, Any]]], Tuple[float, float]]:
         """Load only the frames needed for __getitem__(episode_index, frame_idx). Returns list of length L with None for unloaded."""
         L = self._episode_lengths.get(episode_index, 0)
         last_idx = L - 1
@@ -623,8 +616,6 @@ class KiwiBotDatasetComplete(Dataset):
         indices_to_load = set()
         indices_to_load.add(frame_idx)
         indices_to_load.add(goal_idx)
-        if self.gps_heading:
-            indices_to_load.update(max(0, i - COURSE_BACK_FRAMES) for i in (frame_idx, goal_idx))
         for k in range(NUM_ACTIONS_CHUNK):
             indices_to_load.add(min(frame_idx + k * effective_spacing, last_idx))
         for offset in range(self.context_size + 1): #For MBRA
@@ -632,6 +623,12 @@ class KiwiBotDatasetComplete(Dataset):
         indices_to_load.add(min(frame_idx + (NUM_ACTIONS_CHUNK - 1) * effective_spacing, last_idx))
 
         ds = self._build_lerobot_dataset(episode_index)
+        headings = (0.0, 0.0)
+        if self.gps_heading:
+            # Rows come straight from the table, so the past GPS fixes need no video decode.
+            headings = (course_at(ds.hf_dataset, frame_idx, COURSE_BACK_FRAMES), course_at(ds.hf_dataset, goal_idx, COURSE_BACK_FRAMES))
+            if None in headings:
+                raise _NoCourse()
         steps = [None] * L  # type: List[Optional[Dict[str, Any]]]
         for fi in sorted(indices_to_load):
             if fi >= L:
@@ -639,7 +636,7 @@ class KiwiBotDatasetComplete(Dataset):
             data_item = ds[fi]
             obs, action, lang = _parse_lerobot_step(data_item, action_key=self.action_key)
             steps[fi] = {"observation": obs, "action": action, "language_instruction": lang}
-        return steps
+        return steps, headings
 
     def _build_lerobot_dataset(self, episode_index: int):
         kwargs = {
@@ -683,12 +680,7 @@ class KiwiBotDatasetComplete(Dataset):
             ep_idx, frame_idx = self._index[candidate_idx]
             try:
                 goal_idx = self._goal_idx(ep_idx, frame_idx)
-                steps = self._load_episode_steps_at_frames(ep_idx, frame_idx, goal_idx)
-                headings = (0.0, 0.0)
-                if self.gps_heading:
-                    headings = (self._course_at(steps, frame_idx), self._course_at(steps, goal_idx))
-                    if None in headings:
-                        raise _NoCourse()
+                steps, headings = self._load_episode_steps_at_frames(ep_idx, frame_idx, goal_idx)
                 break
             except _NoCourse:
                 candidate_idx = self._fallback_index(idx, attempt)
