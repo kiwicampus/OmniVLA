@@ -719,6 +719,7 @@ def train(cfg: Dict[str, Any], config_path: Path, smoke_test: bool, resume_from:
         max_decode_retries=int(dataset_cfg.get("max_decode_retries", 8)),
         goal_ahead_frames=dataset_cfg.get("goal_ahead_frames"),
         gps_heading=bool(dataset_cfg.get("gps_heading", False)),
+        text_relabel=float(dataset_cfg.get("text_relabel", 0.0)),
     )
     print(f"Training samples: {len(train_dataset)}")
     effective_batch_size = int(training_cfg["batch_size"]) * max(1, world_size)

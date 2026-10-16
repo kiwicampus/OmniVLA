@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
 
 from omnivla_training.gps_course import course_at
+from omnivla_training.text_relabel import label_pools, relabel
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
@@ -451,6 +452,7 @@ class KiwiBotDatasetComplete(Dataset):
         max_decode_retries: int = 8,
         goal_ahead_frames: Optional[Tuple[int, int]] = None,
         gps_heading: bool = False,
+        text_relabel: float = 0.0,
     ):
         LeRobotDataset, LeRobotDatasetMetadata = _import_lerobot_dataset_classes()
         self.src_dir = Path(src_dir)
@@ -474,6 +476,11 @@ class KiwiBotDatasetComplete(Dataset):
         self.goal_ahead_frames = None if goal_ahead_frames is None else tuple(int(v) for v in goal_ahead_frames)
         # True: the heading comes from the GPS track over the last COURSE_BACK_FRAMES, not 0.
         self.gps_heading = bool(gps_heading)
+        # Share of samples whose text is replaced by a sentence matching the turn ahead (text_relabel.py).
+        self.text_relabel = float(text_relabel)
+        self._label_pools = label_pools(self.src_dir) if self.text_relabel > 0 else None
+        if self._label_pools:
+            print(f"[KiwiBot] Per-frame text on {self.text_relabel:.0%} of samples, sentences: {self._label_pools}")
         self.tolerance_s = None if tolerance_s is None else float(tolerance_s)
         self.max_decode_retries = max(1, int(max_decode_retries))
         self._LeRobotDataset = LeRobotDataset 
@@ -636,6 +643,12 @@ class KiwiBotDatasetComplete(Dataset):
             data_item = ds[fi]
             obs, action, lang = _parse_lerobot_step(data_item, action_key=self.action_key)
             steps[fi] = {"observation": obs, "action": action, "language_instruction": lang}
+        if self._label_pools:
+            step = steps[frame_idx]
+            step["language_instruction"] = relabel(
+                ds.hf_dataset, episode_index, frame_idx, self.text_relabel, self._label_pools,
+                step["language_instruction"] or self.default_language_instruction,
+            )
         return steps, headings
 
     def _build_lerobot_dataset(self, episode_index: int):
