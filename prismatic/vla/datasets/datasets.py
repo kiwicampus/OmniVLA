@@ -819,6 +819,7 @@ class KiwiBotDatasetComplete(Dataset):
             input_ids=input_ids,
             labels=labels,
             dataset_name=dataset_name,
+            episode_index=ep_idx,
             modality_id=modality_id,
             actions=actions.astype(np.float32),
             action_select_mask=action_select_mask,
